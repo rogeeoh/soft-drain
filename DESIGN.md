@@ -29,6 +29,7 @@ soft-drain은 이 둘을 이어 붙인다. 옮길 Pod과 똑같은 Pod을 하나
 kubectl label node node-01 soft-drain.io/drain=true      # 시작
 kubectl get nodes -l soft-drain.io/state=Complete        # 완료 확인
 kubectl label node node-01 soft-drain.io/drain-          # 취소
+kubectl uncordon node-01                                 # 이것도 취소다 (state=Cancelled 로 남는다)
 ```
 
 끝난 노드는 cordon된 채로 남는다. 그 다음에 drain을 하든 노드를 리부팅하든 soft-drain이 상관할 일이 아니다.
@@ -56,11 +57,15 @@ kubectl label node node-01 soft-drain.io/drain-          # 취소
 
 `drain` 라벨이 사라지면 되돌린다 — 우리 값이 박힌 `pod-deletion-cost`를 걷고, `cordoned-by-controller`가 있으면 uncordon하고, `state` 라벨을 지운다.
 
+**drain 중에 누가 uncordon하면 취소다.** `state`가 `InProgress`인데 노드가 `unschedulable`이 아니면 그렇게 된 것이다 — `InProgress`는 cordon을 확인한 뒤에만 붙기 때문에 이 조합이 곧 증거다. cordon은 종료를 보장하던 전제라서, 전제가 사라진 채 계속하지도 않고 다시 cordon해서 사람과 싸우지도 않는다. cost를 걷고 `state=Cancelled`를 붙인 뒤 손을 뗀다. 대체 Pod은 회수 경로가 걷는다. `Cancelled`는 `Complete`처럼 래치다 — 라벨을 걷으면 지워지고, 다시 하려면 라벨을 걷었다가 다시 붙인다.
+
 ### 2. 타깃 표시
 
-타깃은 **그 노드 위에서 owner가 ReplicaSet이고 그 ReplicaSet의 owner가 Deployment인 Pod**이다.
+타깃은 **그 노드 위에서 owner가 ReplicaSet이고 그 ReplicaSet의 owner가 Deployment인 Pod**이다. phase가 `Failed`나 `Succeeded`인 Pod은 빼고 센다 — ReplicaSet도 active로 세지 않는 Pod이라 대체는 이미 딴 곳에 만들어져 있고, 노드에 남은 시체가 완료 판정만 막는다.
 
-`controller.kubernetes.io/pod-deletion-cost = -2147483648`을 쓴다. 대체 Pod을 만들 때 같이 쓴다 — 넘기기까지 미룰 이유가 없고, 그 사이 무관한 스케일다운이 나도 드레인 대상이 먼저 죽는 쪽이 낫다.
+`controller.kubernetes.io/pod-deletion-cost = -2147483648`을 쓴다. 타깃에만 쓰고, 시점은 대체 Pod을 만들기 전이다 — 넘기기까지 미룰 이유가 없고, 그 사이 무관한 스케일다운이 나도 드레인 대상이 먼저 죽는 쪽이 낫다.
+
+대체 Pod에는 쓰지 않는다. 입양 전에는 ReplicaSet이 쳐다보지 않는 Pod이라 값이 무의미하고, 입양 후에 남으면 그 Pod이 다음 스케일다운마다 1순위로 죽는다. 타깃은 지워지면서 값도 같이 사라지므로 걷을 것이 없다.
 
 원래 값이 있었어도 덮어쓰고 복원하지 않는다. 되돌릴 때는 값이 정확히 `-2147483648`인 것만 지운다. 그 값을 쓰는 게 우리뿐이라 값이 이것이면 우리가 붙인 것이다.
 
@@ -82,7 +87,7 @@ kubectl label node node-01 soft-drain.io/drain-          # 취소
 
 **terminating 타깃은 만들기에서 뺀다.** ReplicaSet은 `deletionTimestamp`가 찍힌 Pod을 active에서 빼므로 이미 스스로 대체를 만들고 있고, 노드가 cordon이라 그 Pod은 다른 노드에 뜬다. 자리는 우리가 아무것도 안 해도 비워진다.
 
-**죽은 대체 Pod은 있는 것으로 세지 않는다.** 노드 압력 eviction이나 kubelet admission 거부로 `Failed`가 된 Pod은 Ready가 될 수도 입양될 수도 없다. 살아 있는 것으로 세면 그 타깃이 영원히 멈춘다.
+**죽은 대체 Pod은 있는 것으로 세지 않고, 지운다.** 노드 압력 eviction이나 kubelet admission 거부로 `Failed`가 된 Pod은 Ready가 될 수도 입양될 수도 없다. 살아 있는 것으로 세면 그 타깃이 영원히 멈춘다. Pod에는 재시작이 없어서(phase `Failed`는 터미널이고 `restartPolicy`는 컨테이너 얘기다) 복구는 새 Pod뿐인데, 세지 않고 지우지도 않으면 만들 때마다 시체가 쌓인다. 원인이 지속되면 만들고-죽고-지우기를 반복하다가 원인이 풀리는 순간 수렴한다.
 
 **이미 넘긴 것도 세지 않는다.** 넘기면서 `soft-drain.io/replaces` 라벨을 떼기 때문에 애초에 후보가 아니다. 그래서 넘겼는데 타깃이 살아남은 경우가 자연히 복구된다 — 넘기는 순간 `replicas`가 올라가면 초과분이 증설분에 흡수되어 아무것도 안 지워지는데, 다음 라운드가 "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
 
@@ -114,9 +119,9 @@ spec: <rs.spec.template.spec 그대로>
 
 넘기기 전에 두 가지를 본다.
 
-**대체 Pod이 어느 노드에 앉았는가.** drain 라벨이 붙은 노드면 붙이지 않고 거기서 멈춘다. Warning Event를 내고 그 Pod은 그대로 둔다. 넘겨봐야 Pod이 여전히 그 노드에 있어서 타깃이 하나 더 생길 뿐이고, 그러면 끝나지 않는다.
+**대체 Pod이 어느 노드에 앉았는가.** drain 라벨이 붙은 노드면 넘기지 않고 지운다. 넘겨봐야 그 노드에 타깃이 하나 더 생길 뿐이다. 아직 hash가 없어 어느 ReplicaSet의 자식도 아니므로 지워도 노출은 줄지 않고, 다음 라운드가 새로 만들면 스케줄러가 cordon된 노드를 피해 앉힌다. 지울 때 Warning Event를 남긴다. cordon보다 스케줄이 먼저여서 나중에 drain이 걸린 노드에 앉아 있던 경우가 이걸로 풀린다.
 
-`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드에서 이렇게 된다. cordon을 무시하도록 만든 워크로드이므로 우리가 `nodeAffinity`를 주입해 그 의도를 뒤집지 않는다. 옮길 수 없다는 게 사실이고, 그 사실을 그대로 둔다.
+`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 새로 만든 Pod이 또 drain 노드에 앉을 수 있고, 그러면 만들고 지우기를 반복한다. cordon을 무시하도록 만든 워크로드이므로 우리가 `nodeAffinity`를 주입해 그 의도를 뒤집지 않는다. 반복되는 Warning Event가 옮길 수 없다는 사실을 보여준다.
 
 **사용자 Deployment가 Healthy한가.**
 
@@ -134,7 +139,7 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 
 ### 5. 완료
 
-노드 위에 타깃이 하나도 없으면 `cordoned-by-controller` 어노테이션을 지우고 `state=Complete`를 붙인 뒤 Event를 낸다. 어노테이션을 지우는 것은 cordon의 소유권을 사람에게 넘긴다는 뜻이다. 이게 없으면 완료를 확인하고 라벨을 정리한 사용자가 노드를 다시 열게 되고, 비워 둔 노드에 Pod이 몰린 채로 리부팅하게 된다.
+노드 위에 타깃이 하나도 없으면 `cordoned-by-controller` 어노테이션을 지우고 `state=Complete`를 붙인 뒤 Event를 낸다. 어노테이션을 지우는 것은 cordon의 소유권을 사람에게 넘긴다는 뜻이다. 이양은 단방향이다 — `Complete`가 붙은 노드에는 drain 라벨이 걷힐 때까지 관여하지 않는다. cordon된 노드에 새로 앉을 수 있는 건 `unschedulable`을 tolerate하는 Pod뿐인데, 그건 어차피 옮기지 못하는 부류다. 이게 없으면 완료를 확인하고 라벨을 정리한 사용자가 노드를 다시 열게 되고, 비워 둔 노드에 Pod이 몰린 채로 리부팅하게 된다.
 
 **완료 판정에는 terminating 타깃도 센다.** `deletionTimestamp`가 찍혀도 grace period 동안 계속 돈다. 여기서 빼면 아직 작업이 돌고 있는 노드에 `Complete`가 붙고, 그걸 보고 노드를 리부팅한 사람이 그 작업을 죽인다. 만들기에서는 빼고 완료 판정에서는 세는 이유가 이것이다.
 
@@ -143,7 +148,7 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 | 대상 | 키 | 값 | 쓰는 쪽 |
 |---|---|---|---|
 | 노드 | `soft-drain.io/drain` (라벨) | `"true"` | 사람 |
-| 노드 | `soft-drain.io/state` (라벨) | `InProgress` / `Complete` | 컨트롤러 |
+| 노드 | `soft-drain.io/state` (라벨) | `InProgress` / `Complete` / `Cancelled` | 컨트롤러 |
 | 노드 | `soft-drain.io/cordoned-by-controller` (어노테이션) | `"true"` | 컨트롤러 |
 | 타깃 Pod | `controller.kubernetes.io/pod-deletion-cost` (어노테이션) | `-2147483648` | 컨트롤러 |
 | 대체 Pod | `soft-drain.io/replaces` (라벨) | 타깃 Pod의 UID | 컨트롤러 |
@@ -157,6 +162,7 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 3. `pod-deletion-cost`를 먼저 쓰고 `pod-template-hash`를 나중에 붙인다.
 4. `soft-drain.io/replaces` 라벨이 있는 Pod만 지운다.
 5. controller ownerRef가 있는 Pod은 지우지 않는다.
+6. 대체 Pod을 지울 때는 읽었던 UID와 resourceVersion을 preconditions로 건다. 판정과 삭제 사이에 hash가 붙어 ReplicaSet이 데려간 Pod이면 삭제가 거부되고, 다음 라운드가 다시 판정한다.
 
 ## 안 하는 것
 
@@ -185,7 +191,7 @@ kubectl describe pod <Pending 인 것>
 
 - **여유 자원이 없으면 진행하지 못한다.** 자리는 옛 Pod이 죽어야 나고 옛 Pod은 새 Pod이 Ready여야 죽으므로, 여유가 0이면 스스로 풀리지 않는다. RWO 볼륨과 로컬 PV도 같은 구조다.
 - **배치 규칙이 한 자리를 못 내주면 자원이 남아돌아도 진행하지 못한다.** 노드당 하나로 제한하는 required `podAntiAffinity`를 걸어두고 후보 노드를 전부 채운 경우가 대표적이다. 이건 soft-drain만의 제약이 아니라 "먼저 띄우고 나중에 지운다"는 방식 전체의 산술이다 — 같은 워크로드는 `maxSurge: 1` 롤아웃도 똑같이 막힌다. 그래서 그런 사용자는 이미 `maxUnavailable: 1`로 운영하며 롤아웃마다 `N` 밑으로 내려가는 것을 감수하고 있다. 노드를 뺄 때도 `kubectl drain`을 쓰면 된다.
-- **`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 옮기지 못한다.** 대체 Pod이 같은 노드에 앉고 거기서 멈춘다.
+- **`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 옮기지 못할 수 있다.** 대체 Pod이 drain 노드에 앉을 때마다 지우고 다시 만들기를 반복하고, 다른 노드에 앉는 운이 따라야 끝난다.
 - **입양 전 대체 Pod은 controller가 없어 PDB 집계를 흔든다.** 같은 라벨을 갖고 Ready라 `currentHealthy`에는 들어가는데 `expectedCount`에는 안 들어가서, 그동안 `disruptionsAllowed`가 1 늘어난다. PDB가 지키는 바닥 아래로 내려가지는 않는다. 같은 이유로 사용자 PDB에 `UnmanagedPods` Warning이 쌓인다.
 - **주인 없는 대체 Pod이 있는 노드는 Cluster Autoscaler가 축소하지 못한다.** 넘기기가 멈춘 상태로 오래 가면 그 노드가 컨솔리데이션에서 계속 빠진다.
 - **롤아웃과 겹치면 곧 버려질 대체 Pod을 만든다.** 롤아웃이 끝나면 타깃이 사라지면서 같이 지워지지만, 그동안 롤아웃의 `maxSurge`와 자리를 다툰다.

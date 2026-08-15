@@ -1,5 +1,7 @@
 # soft-drain - AI Agent Guide
 
+> **이 문서는 kubebuilder가 생성한 범용 안내서다. 설계 규범은 DESIGN.md, 작업 규칙은 CLAUDE.md이며 충돌 시 그쪽이 우선한다. 이 프로젝트는 CRD를 만들지 않는다 — `api/`, `config/crd` 관련 내용은 해당 없다.**
+
 ## Project Structure
 
 **Single-group layout (default):**
