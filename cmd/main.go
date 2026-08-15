@@ -177,15 +177,16 @@ func main() {
 	}
 
 	if err := (&controller.NodeReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Reader:   mgr.GetAPIReader(),
+		Recorder: mgr.GetEventRecorder("soft-drain"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "Node")
 		os.Exit(1)
 	}
 	if err := (&controller.PodReconciler{
 		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Reader: mgr.GetAPIReader(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "Pod")
 		os.Exit(1)

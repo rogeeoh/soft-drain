@@ -48,6 +48,10 @@ var (
 )
 
 func TestControllers(t *testing.T) {
+	// envtest 바이너리가 없으면 유닛 테스트만 돈다. envtest는 make test로.
+	if os.Getenv("KUBEBUILDER_ASSETS") == "" && getFirstFoundEnvTestBinaryDir() == "" {
+		t.Skip("envtest binaries not found; run via make test")
+	}
 	RegisterFailHandler(Fail)
 
 	RunSpecs(t, "Controller Suite")
