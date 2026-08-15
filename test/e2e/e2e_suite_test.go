@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -31,17 +32,19 @@ import (
 	"github.com/rogeeoh/soft-drain/test/utils"
 )
 
-var (
-	// managerImage is the manager image to be built and loaded for testing.
-	managerImage = "example.com/soft-drain:v0.0.1"
-	// shouldCleanupCertManager tracks whether CertManager was installed by this suite.
-	shouldCleanupCertManager = false
-)
+// managerImage is the manager image to be built and loaded for testing.
+var managerImage = "example.com/soft-drain:v0.0.1"
 
-// TestE2E runs the e2e test suite to validate the solution in an isolated environment.
-// The default setup requires Kind and CertManager.
-//
-// To skip CertManager installation, set: CERT_MANAGER_INSTALL_SKIP=true
+// workloadImage is the image used for the workloads that get drained.
+const workloadImage = "nginx:alpine"
+
+func kindClusterName() string {
+	if v := os.Getenv("KIND_CLUSTER"); v != "" {
+		return v
+	}
+	return "soft-drain-test-e2e"
+}
+
 func TestE2E(t *testing.T) {
 	RegisterFailHandler(Fail)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Starting soft-drain e2e test suite\n")
@@ -49,53 +52,23 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
+	// 실 클러스터 보호: 현재 컨텍스트가 전용 kind 클러스터일 때만 진행한다 (CLAUDE.md)
+	out, err := utils.Run(exec.Command("kubectl", "config", "current-context"))
+	Expect(err).NotTo(HaveOccurred(), "Failed to read current kubectl context")
+	Expect(strings.TrimSpace(out)).To(Equal("kind-"+kindClusterName()),
+		"e2e must run against the dedicated kind cluster, current context is %q", strings.TrimSpace(out))
+
 	By("building the manager image")
 	cmd := exec.Command("make", "docker-build", fmt.Sprintf("IMG=%s", managerImage))
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the manager image")
+	_, err = utils.Run(cmd)
+	Expect(err).NotTo(HaveOccurred(), "Failed to build the manager image")
 
-	// TODO(user): If you want to change the e2e test vendor from Kind,
-	// ensure the image is built and available, then remove the following block.
 	By("loading the manager image on Kind")
-	err = utils.LoadImageToKindClusterWithName(managerImage)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load the manager image into Kind")
+	Expect(utils.LoadImageToKindClusterWithName(managerImage)).To(Succeed(),
+		"Failed to load the manager image into Kind")
 
-	setupCertManager()
+	By("preloading the workload image on Kind")
+	if _, err := utils.Run(exec.Command("docker", "pull", workloadImage)); err == nil {
+		_ = utils.LoadImageToKindClusterWithName(workloadImage)
+	}
 })
-
-var _ = AfterSuite(func() {
-	teardownCertManager()
-})
-
-// setupCertManager installs CertManager if needed for webhook tests.
-// Skips installation if CERT_MANAGER_INSTALL_SKIP=true or if already present.
-func setupCertManager() {
-	if os.Getenv("CERT_MANAGER_INSTALL_SKIP") == "true" {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping CertManager installation (CERT_MANAGER_INSTALL_SKIP=true)\n")
-		return
-	}
-
-	By("checking if CertManager is already installed")
-	if utils.IsCertManagerCRDsInstalled() {
-		_, _ = fmt.Fprintf(GinkgoWriter, "CertManager is already installed. Skipping installation.\n")
-		return
-	}
-
-	// Mark for cleanup before installation to handle interruptions and partial installs.
-	shouldCleanupCertManager = true
-
-	By("installing CertManager")
-	Expect(utils.InstallCertManager()).To(Succeed(), "Failed to install CertManager")
-}
-
-// teardownCertManager uninstalls CertManager if it was installed by setupCertManager.
-// This ensures we only remove what we installed.
-func teardownCertManager() {
-	if !shouldCleanupCertManager {
-		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping CertManager cleanup (not installed by this suite)\n")
-		return
-	}
-
-	By("uninstalling CertManager")
-	utils.UninstallCertManager()
-}

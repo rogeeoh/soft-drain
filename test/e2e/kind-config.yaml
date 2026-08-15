@@ -1,7 +1,9 @@
-# e2e용 kind 클러스터. drain할 노드와 대체 Pod이 옮겨 갈 노드가 필요해서 worker가 둘이다.
+# e2e용 kind 클러스터. 다중 노드 drain과 워크로드 확산 시나리오를 위해 워커 4개.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
   - role: control-plane
+  - role: worker
+  - role: worker
   - role: worker
   - role: worker
