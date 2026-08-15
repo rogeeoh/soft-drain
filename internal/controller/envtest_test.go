@@ -304,6 +304,60 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(live).To(Equal(1))
 	})
 
+	It("판정과 삭제 사이에 hash가 붙은 Pod은 지우지 않는다", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		repl := createReplacement(f, other.Name, true)
+
+		// 삭제자(PodReconciler)가 읽어둔 시점의 복사본
+		stale := repl.DeepCopy()
+
+		// 그 사이 넘기기가 patch 하나로 hash를 붙이고 replaces를 뗀다
+		patch := mergePatch(map[string]any{
+			"metadata": map[string]any{"labels": map[string]any{
+				LabelPodTemplateHash: testHash,
+				LabelReplaces:        nil,
+			}},
+		})
+		Expect(k8sClient.Patch(ctx, repl, patch)).To(Succeed())
+
+		// stale 복사본으로 삭제 시도 — resourceVersion precondition이 거부한다
+		deleted, err := deleteReplacement(ctx, k8sClient, stale)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(deleted).To(BeFalse())
+		Expect(getPod(repl.Name).DeletionTimestamp).To(BeNil())
+	})
+
+	It("넘겼는데 타깃이 살아남으면 다음 라운드가 새 대체 Pod을 만든다", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		repl := createReplacement(f, other.Name, true)
+		setDeployHealthy(f.deploy)
+
+		// 1라운드: 넘기기까지 간다
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		handed := getPod(repl.Name)
+		Expect(handed.Labels[LabelPodTemplateHash]).To(Equal(testHash))
+
+		// envtest에는 RS 컨트롤러가 없어 타깃이 지워지지 않는다 — 넘기는 순간
+		// replicas가 올라 초과분이 증설분에 흡수된 것과 같은 상태다.
+		// 2라운드: "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		var live []corev1.Pod
+		for _, p := range listReplacements(f.target.UID) {
+			if p.DeletionTimestamp == nil {
+				live = append(live, p)
+			}
+		}
+		Expect(live).To(HaveLen(1))
+		Expect(live[0].Name).NotTo(Equal(repl.Name))
+		// 넘긴 Pod은 건드리지 않았다
+		Expect(getPod(repl.Name).Labels).NotTo(HaveKey(LabelReplaces))
+	})
+
 	It("타깃이 없으면 Complete를 붙이고 cordon 소유권을 넘긴다", func() {
 		rec := &fakeRecorder{}
 		r := &NodeReconciler{Client: k8sClient, Reader: k8sClient, Recorder: rec}
