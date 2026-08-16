@@ -75,6 +75,7 @@ kubectl soft-drain node-01 node-02        # label + progress until all Complete
 kubectl soft-drain node-01 --wait=false   # label only
 kubectl soft-drain status                 # every node under soft-drain (-o json|yaml)
 kubectl soft-drain release node-01 ...    # remove the labels, wait for restore
+kubectl soft-drain version                # plugin version
 ```
 
 `release` cancels an in-flight drain and retires a completed one — both are the same
@@ -106,6 +107,40 @@ make deploy
 ```
 
 Requires Kubernetes ≥ 1.22 (`pod-deletion-cost`).
+
+## Wiring it into automation
+
+The node labels are the whole contract — a pipeline needs nothing but kubectl:
+
+```bash
+kubectl label node "$NODE" soft-drain.com/drain=true
+kubectl wait node/"$NODE" --timeout=2h \
+  --for=jsonpath='{.metadata.labels.soft-drain\.com/state}'=Complete
+# state=Cancelled instead means a human uncordoned the node: abort your pipeline.
+kubectl label node "$NODE" soft-drain.com/drain-   # release once you are done
+```
+
+Or let the plugin do the waiting and gate on its exit code:
+
+```bash
+kubectl soft-drain "$NODE" --timeout 2h && retire-node "$NODE"
+```
+
+Exit codes: `0` drained, `1` failed or timed out (pending replacements and their
+scheduler messages go to stderr), `130` interrupted — the drain keeps running.
+
+A human or pipeline driving drains needs only this RBAC (the controller's own
+ServiceAccount is the only thing that ever creates or deletes Pods):
+
+```yaml
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, watch, patch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+```
 
 ## What it guarantees — and what it doesn't
 

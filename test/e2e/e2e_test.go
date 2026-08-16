@@ -1402,6 +1402,11 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(replacementPods(app)).To(HaveLen(1))
 		}, 60*time.Second, 2*time.Second).Should(Succeed())
 
+		By("printing the version without touching the cluster")
+		out, err = utils.Run(exec.Command(plugin, "version"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(strings.TrimSpace(out)).To(HavePrefix("kubectl-soft_drain"))
+
 		By("checking status output, human and machine")
 		out, err = utils.Run(exec.Command(plugin, "status"))
 		Expect(err).NotTo(HaveOccurred(), out)
