@@ -65,7 +65,11 @@ A thin wrapper with `git stash`-style grammar — the bare node form mirrors
 and watches the rest:
 
 ```bash
-make plugin && cp bin/kubectl-soft_drain ~/bin/   # anywhere on your PATH
+# from a release (binary + shell completion; pick your os_arch)
+curl -sL https://github.com/rogeeoh/soft-drain/releases/download/v0.1.0/kubectl-soft_drain_0.1.0_darwin_arm64.tar.gz \
+  | tar xz -C ~/bin kubectl-soft_drain kubectl_complete-soft_drain
+# or from source
+make plugin && cp bin/kubectl-soft_drain hack/kubectl_complete-soft_drain ~/bin/
 
 kubectl soft-drain node-01 node-02        # label + progress until all Complete
 kubectl soft-drain node-01 --wait=false   # label only
