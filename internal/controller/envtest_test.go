@@ -417,6 +417,35 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getNode(f.node.Name).Spec.Unschedulable).To(BeFalse())
 	})
 
+	It("Complete 뒤 uncordon되면 관여를 접는다", func() {
+		f := setupFixture()
+		Expect(k8sClient.Delete(ctx, f.target, client.GracePeriodSeconds(0))).To(Succeed())
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateComplete))
+
+		// 소유권을 넘겨받은 사람이 노드를 다시 쓰기로 함
+		node := getNode(f.node.Name)
+		node.Spec.Unschedulable = false
+		Expect(k8sClient.Update(ctx, node)).To(Succeed())
+
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		got := getNode(f.node.Name)
+		Expect(got.Labels[LabelState]).To(Equal(StateCancelled))
+		Expect(got.Spec.Unschedulable).To(BeFalse())
+		Expect(f.rec.has("DrainCancelled")).To(BeTrue())
+
+		// Cancelled로 접혔으므로 착지 검사도 이 노드를 막지 않는다
+		Expect(drainActive(got)).To(BeFalse())
+
+		// 래치: 다시 돌려도 cordon하지 않는다
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getNode(f.node.Name).Spec.Unschedulable).To(BeFalse())
+	})
+
 	It("drain 라벨이 사라지면 되돌린다", func() {
 		f := setupFixture()
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
