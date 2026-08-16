@@ -67,10 +67,10 @@ and watches the rest:
 ```bash
 make plugin && cp bin/kubectl-soft_drain ~/bin/   # anywhere on your PATH
 
-kubectl soft-drain node-01                # label + progress until Complete
+kubectl soft-drain node-01 node-02        # label + progress until all Complete
 kubectl soft-drain node-01 --wait=false   # label only
 kubectl soft-drain status                 # every node under soft-drain (-o json|yaml)
-kubectl soft-drain release node-01        # remove the label, wait for restore
+kubectl soft-drain release node-01 ...    # remove the labels, wait for restore
 ```
 
 `release` cancels an in-flight drain and retires a completed one — both are the same

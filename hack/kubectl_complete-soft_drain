@@ -7,27 +7,43 @@ set -euo pipefail
 args=("$@")
 cur="${args[${#args[@]}-1]}"
 
+# kubectl invokes this with the words AFTER the plugin name, so args[0] is
+# already a subcommand, node, or flag — scan from 0, the last word is `cur`.
 # Pass --context/--kubeconfig through so node names come from the right cluster.
-# Remember whether a subcommand word is already present.
+# Remember the subcommand word and every node already typed, to exclude them.
 passthrough=()
 subcommand=""
-for ((i = 1; i < ${#args[@]} - 1; i++)); do
-  case "${args[$i]}" in
+chosen=()
+skip_value=0
+for ((i = 0; i < ${#args[@]} - 1; i++)); do
+  a="${args[$i]}"
+  if [[ $skip_value == 1 ]]; then skip_value=0; continue; fi
+  case "$a" in
     --context|--kubeconfig)
-      passthrough+=("${args[$i]}" "${args[$((i + 1))]}")
+      passthrough+=("$a" "${args[$((i + 1))]}")
+      skip_value=1
       ;;
     --context=*|--kubeconfig=*)
-      passthrough+=("${args[$i]}")
+      passthrough+=("$a")
       ;;
+    -o|--output|--timeout)
+      skip_value=1
+      ;;
+    -*) ;;
     status|release)
-      subcommand="${args[$i]}"
+      subcommand="$a"
+      ;;
+    *)
+      chosen+=("$a")
       ;;
   esac
 done
 
 nodes() {
   # ${arr[@]+...} keeps macOS bash 3.2 happy when the array is empty under set -u.
-  kubectl get nodes -o name "$@" ${passthrough[@]+"${passthrough[@]}"} 2>/dev/null | sed 's|^node/||'
+  kubectl get nodes -o name "$@" ${passthrough[@]+"${passthrough[@]}"} 2>/dev/null \
+    | sed 's|^node/||' \
+    | grep -F -x -v ${chosen[@]+-f <(printf '%s\n' "${chosen[@]}")} -e '__never__' || true
 }
 
 if [[ "$cur" == -* ]]; then
@@ -36,7 +52,9 @@ elif [[ -n "$subcommand" ]]; then
   # status/release 뒤에는 soft-drain이 관여 중인 노드만 후보다.
   nodes -l soft-drain.com/drain
 else
-  printf '%s\n' status release
+  if [[ ${#chosen[@]} -eq 0 ]]; then
+    printf '%s\n' status release
+  fi
   nodes
 fi
 echo ":4"
