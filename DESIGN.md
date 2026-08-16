@@ -26,13 +26,28 @@ soft-drain은 이 둘을 이어 붙인다. 옮길 Pod과 똑같은 Pod을 하나
 ## 쓰는 법
 
 ```
-kubectl label node node-01 soft-drain.io/drain=true      # 시작
-kubectl get nodes -l soft-drain.io/state=Complete        # 완료 확인
-kubectl label node node-01 soft-drain.io/drain-          # 취소
+kubectl label node node-01 soft-drain.com/drain=true      # 시작
+kubectl get nodes -l soft-drain.com/state=Complete        # 완료 확인
+kubectl label node node-01 soft-drain.com/drain-          # 취소
 kubectl uncordon node-01                                 # 이것도 취소다 (state=Cancelled 로 남는다)
 ```
 
 끝난 노드는 cordon된 채로 남는다. 그 다음에 drain을 하든 노드를 리부팅하든 soft-drain이 상관할 일이 아니다.
+
+### kubectl 플러그인
+
+`kubectl soft-drain`은 위 네 줄의 포장이다. **쓰는 것은 drain 라벨 하나뿐이고 나머지는 읽기다** — 서버 쪽 표면은 늘지 않는다.
+
+```
+kubectl soft-drain node-01                 # 라벨을 붙이고 Complete까지 진행을 보여준다
+kubectl soft-drain node-01 --wait=false    # 라벨만 붙이고 돌아온다
+kubectl soft-drain node-01 --timeout 30m   # 기본 0 = 무한
+kubectl soft-drain node-01 --cancel        # 라벨을 걷고 복원을 기다린다
+```
+
+`--timeout`이 터지면 Pending 대체 Pod과 스케줄러 메시지를 보여주고 0이 아닌 코드로 나간다 — "막혔을 때 보는 법"의 자동화다. 중간에 끊어도 라벨은 남으므로 drain은 계속된다. `state=Cancelled`인 노드에 다시 걸면 라벨을 걷어 복원시킨 뒤 다시 붙인다.
+
+`kubectl drain`의 `--ignore-daemonsets`, `--delete-emptydir-data`, `--force`는 없다. eviction 전제의 개념이라 여기 해당이 없다.
 
 ## 컨트롤러가 하는 일
 
@@ -75,7 +90,7 @@ kubectl uncordon node-01                                 # 이것도 취소다 (
 
 ```
 있어야 할 것 = deletionTimestamp 가 없는 타깃마다 하나
-있는 것      = soft-drain.io/replaces = <타깃 UID> 이면서
+있는 것      = soft-drain.com/replaces = <타깃 UID> 이면서
                controller ownerRef 없고
                phase 가 Failed / Succeeded 가 아니고
                deletionTimestamp 도 없는 Pod
@@ -89,7 +104,7 @@ kubectl uncordon node-01                                 # 이것도 취소다 (
 
 **죽은 대체 Pod은 있는 것으로 세지 않고, 지운다.** 노드 압력 eviction이나 kubelet admission 거부로 `Failed`가 된 Pod은 Ready가 될 수도 입양될 수도 없다. 살아 있는 것으로 세면 그 타깃이 영원히 멈춘다. Pod에는 재시작이 없어서(phase `Failed`는 터미널이고 `restartPolicy`는 컨테이너 얘기다) 복구는 새 Pod뿐인데, 세지 않고 지우지도 않으면 만들 때마다 시체가 쌓인다. 원인이 지속되면 만들고-죽고-지우기를 반복하다가 원인이 풀리는 순간 수렴한다.
 
-**이미 넘긴 것도 세지 않는다.** 넘기면서 `soft-drain.io/replaces` 라벨을 떼기 때문에 애초에 후보가 아니다. 그래서 넘겼는데 타깃이 살아남은 경우가 자연히 복구된다 — 넘기는 순간 `replicas`가 올라가면 초과분이 증설분에 흡수되어 아무것도 안 지워지는데, 다음 라운드가 "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
+**이미 넘긴 것도 세지 않는다.** 넘기면서 `soft-drain.com/replaces` 라벨을 떼기 때문에 애초에 후보가 아니다. 그래서 넘겼는데 타깃이 살아남은 경우가 자연히 복구된다 — 넘기는 순간 `replicas`가 올라가면 초과분이 증설분에 흡수되어 아무것도 안 지워지는데, 다음 라운드가 "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
 
 **만드는 쪽과 지우는 쪽 양쪽에서 깨어나야 한다.** 노드에서 출발하는 순회만 있으면, ReplicaSet이 prune될 때 타깃 Pod도 같이 사라져서 순회할 대상이 없어지고 대체 Pod을 쳐다볼 일이 없어진다. 그래서 대체 Pod 자체를 키로 하는 경로가 따로 있어야 한다. 판정은 위 한 줄로 같다.
 
@@ -100,7 +115,7 @@ metadata:
   generateName: aaa-5449d4d8c8-        # 타깃의 ReplicaSet 이름 + "-"
   labels:
     app: aaa                            # rs.spec.template.metadata.labels 에서
-    soft-drain.io/replaces: 3f2a...     # 타깃 Pod의 UID
+    soft-drain.com/replaces: 3f2a...     # 타깃 Pod의 UID
     # pod-template-hash 는 뺀다
 spec: <rs.spec.template.spec 그대로>
 ```
@@ -113,7 +128,7 @@ spec: <rs.spec.template.spec 그대로>
 
 ### 4. 넘기기
 
-대체 Pod이 Ready가 되면 patch 하나로 `pod-template-hash`를 붙이고 `soft-drain.io/replaces`를 뗀다.
+대체 Pod이 Ready가 되면 patch 하나로 `pod-template-hash`를 붙이고 `soft-drain.com/replaces`를 뗀다.
 
 붙일 hash는 **타깃 Pod의 ownerRef가 가리키는 ReplicaSet**에서 읽는다. Deployment를 거쳐 현재 ReplicaSet을 찾는 경로는 쓰지 않는다 — 대체 Pod은 타깃의 ReplicaSet 템플릿으로 만들어졌고, 롤아웃 중이면 그게 현재 ReplicaSet이 아닐 수 있다.
 
@@ -147,20 +162,20 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 
 | 대상 | 키 | 값 | 쓰는 쪽 |
 |---|---|---|---|
-| 노드 | `soft-drain.io/drain` (라벨) | `"true"` | 사람 |
-| 노드 | `soft-drain.io/state` (라벨) | `InProgress` / `Complete` / `Cancelled` | 컨트롤러 |
-| 노드 | `soft-drain.io/cordoned-by-controller` (어노테이션) | `"true"` | 컨트롤러 |
+| 노드 | `soft-drain.com/drain` (라벨) | `"true"` | 사람 |
+| 노드 | `soft-drain.com/state` (라벨) | `InProgress` / `Complete` / `Cancelled` | 컨트롤러 |
+| 노드 | `soft-drain.com/cordoned-by-controller` (어노테이션) | `"true"` | 컨트롤러 |
 | 타깃 Pod | `controller.kubernetes.io/pod-deletion-cost` (어노테이션) | `-2147483648` | 컨트롤러 |
-| 대체 Pod | `soft-drain.io/replaces` (라벨) | 타깃 Pod의 UID | 컨트롤러 |
+| 대체 Pod | `soft-drain.com/replaces` (라벨) | 타깃 Pod의 UID | 컨트롤러 |
 
-`soft-drain.io/replaces`를 쓰는 것은 우리뿐이다. 이 라벨이 없는 Pod은 만들지도 지우지도 않는다.
+`soft-drain.com/replaces`를 쓰는 것은 우리뿐이다. 이 라벨이 없는 Pod은 만들지도 지우지도 않는다.
 
 ## 지켜야 할 것
 
 1. 대체 Pod은 `pod-template-hash` 없이 만든다.
 2. 대체 Pod의 스펙은 살아 있는 Pod이 아니라 `rs.spec.template`에서 가져온다.
 3. `pod-deletion-cost`를 먼저 쓰고 `pod-template-hash`를 나중에 붙인다.
-4. `soft-drain.io/replaces` 라벨이 있는 Pod만 지운다.
+4. `soft-drain.com/replaces` 라벨이 있는 Pod만 지운다.
 5. controller ownerRef가 있는 Pod은 지우지 않는다.
 6. 대체 Pod을 지울 때는 읽었던 UID와 resourceVersion을 preconditions로 건다. 판정과 삭제 사이에 hash가 붙어 ReplicaSet이 데려간 Pod이면 삭제가 거부되고, 다음 라운드가 다시 판정한다.
 
@@ -172,14 +187,13 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 - PDB를 조회하지 않는다. 지우는 주체가 사용자 ReplicaSet이라 eviction API를 타지 않는다.
 - 사용자 Deployment의 `spec`을 수정하지 않는다. 사용자 Pod에는 어노테이션 하나만 쓴다.
 - 노드를 drain하거나 끄지 않는다.
-- kubectl 플러그인과 `--wait`는 나중에.
 
 ## 막혔을 때 보는 법
 
 노드가 `InProgress`에서 안 움직이면 대체 Pod을 본다.
 
 ```bash
-kubectl get pods -A -l soft-drain.io/replaces
+kubectl get pods -A -l soft-drain.com/replaces
 kubectl describe pod <Pending 인 것>
 ```
 

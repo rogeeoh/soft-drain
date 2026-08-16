@@ -273,7 +273,7 @@ spec:
 }
 
 func nodeStateLabel(node string) string {
-	out, _ := kubectl("get", "node", node, "-o", `jsonpath={.metadata.labels.soft-drain\.io/state}`)
+	out, _ := kubectl("get", "node", node, "-o", `jsonpath={.metadata.labels.soft-drain\.com/state}`)
 	return strings.TrimSpace(out)
 }
 
@@ -308,7 +308,7 @@ func podCost(name string) string {
 // replacementPods는 그 앱의 대체 Pod만 센다. 클러스터 전역으로 세면
 // 다른 스펙이나 이전 실행이 남긴 것에 오염된다.
 func replacementPods(app string) []string {
-	out := mustKubectl("get", "pods", "-n", "default", "-l", "soft-drain.io/replaces,app="+app,
+	out := mustKubectl("get", "pods", "-n", "default", "-l", "soft-drain.com/replaces,app="+app,
 		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`)
 	return nonEmptyLines(out)
 }
@@ -352,9 +352,9 @@ func pickWorker() string {
 // cleanup은 best-effort다. 마지막 스펙의 DeferCleanup은 AfterAll(컨트롤러
 // undeploy) 뒤에 돌 수 있어 컨트롤러의 restore에 기대지 않고 직접 걷는다.
 func cleanupDrainNode(node string) {
-	_, _ = kubectl("label", "node", node, "soft-drain.io/drain-")
-	_, _ = kubectl("label", "node", node, "soft-drain.io/state-")
-	_, _ = kubectl("annotate", "node", node, "soft-drain.io/cordoned-by-controller-")
+	_, _ = kubectl("label", "node", node, "soft-drain.com/drain-")
+	_, _ = kubectl("label", "node", node, "soft-drain.com/state-")
+	_, _ = kubectl("annotate", "node", node, "soft-drain.com/cordoned-by-controller-")
 	_, _ = kubectl("uncordon", node)
 }
 
@@ -400,7 +400,7 @@ func startPinnedDrain(app, worker string, w workload) (origPod string) {
 	mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
 	origPod = podsOf(app)[0]
 
-	mustKubectl("label", "node", worker, "soft-drain.io/drain=true")
+	mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 	EventuallyWithOffset(1, func(g Gomega) {
 		g.Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
 		repls := replacementPods(app)
@@ -506,7 +506,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		DeferCleanup(func() { cleanupDrain(srcNode, app) })
 
 		By("labeling the node")
-		mustKubectl("label", "node", srcNode, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", srcNode, "soft-drain.com/drain=true")
 
 		By("waiting for Complete")
 		Eventually(func() string { return nodeStateLabel(srcNode) },
@@ -525,7 +525,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			// ReplicaSet에 입양됐다: hash는 있고 replaces는 없다
 			labels := mustKubectl("get", "pod", "-n", "default", pods[0], "-o", "jsonpath={.metadata.labels}")
 			g.Expect(labels).To(ContainSubstring("pod-template-hash"))
-			g.Expect(labels).NotTo(ContainSubstring("soft-drain.io/replaces"))
+			g.Expect(labels).NotTo(ContainSubstring("soft-drain.com/replaces"))
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
@@ -552,7 +552,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		By("watching availability and draining the node")
 		monitor := watchAvailability(apps)
-		mustKubectl("label", "node", srcNode, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", srcNode, "soft-drain.com/drain=true")
 		Eventually(func() string { return nodeStateLabel(srcNode) },
 			5*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -578,7 +578,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podCost(origPod)).To(Equal("-2147483648"))
 
 		By("removing the label")
-		mustKubectl("label", "node", worker, "soft-drain.io/drain-")
+		mustKubectl("label", "node", worker, "soft-drain.com/drain-")
 
 		By("waiting for the node and the workload to be restored")
 		Eventually(func(g Gomega) {
@@ -624,7 +624,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		srcNode := nodeOfPod(origPod)
 		DeferCleanup(func() { cleanupDrain(srcNode, app) })
 
-		mustKubectl("label", "node", srcNode, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", srcNode, "soft-drain.com/drain=true")
 
 		By("triggering a rolling update mid-drain")
 		mustKubectl("patch", "deployment", "-n", "default", app, "--type=merge",
@@ -728,7 +728,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		By("cordoning off every other worker first")
 		for _, w := range workers {
 			if w != src {
-				mustKubectl("label", "node", w, "soft-drain.io/drain=true")
+				mustKubectl("label", "node", w, "soft-drain.com/drain=true")
 			}
 		}
 		Eventually(func(g Gomega) {
@@ -740,7 +740,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 
 		By("draining the workload's node")
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
 		By("waiting for the stuck state")
 		Eventually(func(g Gomega) {
@@ -760,7 +760,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			}
 		}
 		By("freeing one completed worker")
-		mustKubectl("label", "node", freed, "soft-drain.io/drain-")
+		mustKubectl("label", "node", freed, "soft-drain.com/drain-")
 		mustKubectl("uncordon", freed)
 
 		By("waiting for the stuck drain to complete")
@@ -782,18 +782,18 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		By("cordoning first, then labeling")
 		mustKubectl("cordon", src)
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
 		Eventually(func() string { return nodeStateLabel(src) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
 		// 우리가 건 cordon이 아니므로 어노테이션이 없다
 		ann, _ := kubectl("get", "node", src,
-			"-o", `jsonpath={.metadata.annotations.soft-drain\.io/cordoned-by-controller}`)
+			"-o", `jsonpath={.metadata.annotations.soft-drain\.com/cordoned-by-controller}`)
 		Expect(strings.TrimSpace(ann)).To(BeEmpty())
 
 		By("removing the label keeps the human's cordon")
-		mustKubectl("label", "node", src, "soft-drain.io/drain-")
+		mustKubectl("label", "node", src, "soft-drain.com/drain-")
 		Eventually(func() string { return nodeStateLabel(src) },
 			60*time.Second, 2*time.Second).Should(BeEmpty())
 		Expect(nodeUnschedulable(src)).To(Equal("true"))
@@ -810,7 +810,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		applyYAML(nakedPodYAML(naked, worker))
 		mustKubectl("wait", "--for=condition=Ready", "pod/"+naked, "-n", "default", "--timeout=120s")
 
-		mustKubectl("label", "node", worker, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
 		// naked pod은 타깃이 아니므로 노드는 곧바로 Complete가 된다
 		Eventually(func() string { return nodeStateLabel(worker) },
@@ -834,7 +834,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		})
 
 		By("draining the first node")
-		mustKubectl("label", "node", first, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", first, "soft-drain.com/drain=true")
 		Eventually(func() string { return nodeStateLabel(first) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -848,9 +848,9 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 
 		By("restoring the first node and draining the second")
-		mustKubectl("label", "node", first, "soft-drain.io/drain-")
+		mustKubectl("label", "node", first, "soft-drain.com/drain-")
 		mustKubectl("uncordon", first)
-		mustKubectl("label", "node", second, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", second, "soft-drain.com/drain=true")
 		Eventually(func() string { return nodeStateLabel(second) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -874,7 +874,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		_, _ = kubectl("delete", "events", "-n", "default",
 			"--field-selector", "reason=ReplacementOnDrainingNode", "--ignore-not-found")
 
-		mustKubectl("label", "node", worker, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
 		// 대체 Pod이 cordon을 뚫고 같은 노드에 앉아 Ready가 되면 지워지고,
 		// 다음 라운드가 다시 만든다. 반복 Warning Event가 그 증거다.
@@ -899,7 +899,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		deployPackedOnNode(workload{name: app, replicas: 3}, worker)
 
 		monitor := watchAvailability(map[string]int{app: 3})
-		mustKubectl("label", "node", worker, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 		Eventually(func() string { return nodeStateLabel(worker) },
 			4*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -932,7 +932,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}
 
 		monitor := watchAvailability(map[string]int{app: 3})
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 		Eventually(func() string { return nodeStateLabel(src) },
 			4*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -961,8 +961,8 @@ var _ = Describe("soft-drain", Ordered, func() {
 		})
 
 		monitor := watchAvailability(map[string]int{app: 2})
-		mustKubectl("label", "node", nodeA, "soft-drain.io/drain=true")
-		mustKubectl("label", "node", nodeB, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", nodeA, "soft-drain.com/drain=true")
+		mustKubectl("label", "node", nodeB, "soft-drain.com/drain=true")
 
 		Eventually(func(g Gomega) {
 			g.Expect(nodeStateLabel(nodeA)).To(Equal("Complete"))
@@ -992,7 +992,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		src := nodeOfPod(podsOf(app)[0])
 		DeferCleanup(func() { cleanupDrain(src, app) })
 
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 		Eventually(func(g Gomega) {
 			g.Expect(nodeStateLabel(src)).To(Equal("InProgress"))
 			repls := replacementPods(app)
@@ -1004,7 +1004,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Consistently(func() string { return nodeStateLabel(src) },
 			30*time.Second, 5*time.Second).Should(Equal("InProgress"))
 
-		mustKubectl("label", "node", src, "soft-drain.io/drain-")
+		mustKubectl("label", "node", src, "soft-drain.com/drain-")
 		Eventually(func(g Gomega) {
 			g.Expect(nodeStateLabel(src)).To(BeEmpty())
 			g.Expect(replacementPods(app)).To(BeEmpty())
@@ -1030,7 +1030,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 30*time.Second, 5*time.Second).Should(Succeed())
 
 		// 재기동한 컨트롤러가 취소도 처리한다
-		mustKubectl("label", "node", worker, "soft-drain.io/drain-")
+		mustKubectl("label", "node", worker, "soft-drain.com/drain-")
 		Eventually(func(g Gomega) {
 			g.Expect(nodeStateLabel(worker)).To(BeEmpty())
 			g.Expect(nodeUnschedulable(worker)).To(BeEmpty())
@@ -1054,7 +1054,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			"-n", namespace, "--timeout=60s")
 
 		By("labeling while nobody is watching")
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 		Consistently(func() string { return nodeStateLabel(src) },
 			10*time.Second, 2*time.Second).Should(BeEmpty())
 
@@ -1086,7 +1086,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(src).To(ContainSubstring("worker"))
 		DeferCleanup(func() { cleanupDrainNode(src) })
 
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
 		// Complete는 옛 컨트롤러 Pod 오브젝트가 사라진 뒤에만 붙을 수 있고,
 		// 그 시점에 옛 인스턴스는 이미 죽어 있다 — 이주한 새 인스턴스가
@@ -1100,7 +1100,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			node := strings.TrimSpace(mustKubectl("get", "pod", "-n", namespace, pods[0],
 				"-o", "jsonpath={.spec.nodeName}"))
 			g.Expect(node).NotTo(Equal(src))
-			repl, _ := kubectl("get", "pods", "-n", namespace, "-l", "soft-drain.io/replaces",
+			repl, _ := kubectl("get", "pods", "-n", namespace, "-l", "soft-drain.com/replaces",
 				"-o", "jsonpath={.items[*].metadata.name}")
 			g.Expect(strings.TrimSpace(repl)).To(BeEmpty())
 			g.Expect(strings.TrimSpace(mustKubectl("get", "deploy", "-n", namespace,
@@ -1159,7 +1159,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("patch", "deployment", "-n", "default", app, "--type=merge",
 			"-p", `{"spec":{"template":{"metadata":{"labels":{"rollout":"v2"}}}}}`)
 
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
 		// 대체 Pod이 Ready가 되어도 replaces 라벨을 단 채 남아 있어야 한다
 		By("verifying the handover is deferred")
@@ -1196,12 +1196,12 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		By("flapping the label")
 		for i := 0; i < 3; i++ {
-			mustKubectl("label", "node", src, "soft-drain.io/drain=true", "--overwrite")
+			mustKubectl("label", "node", src, "soft-drain.com/drain=true", "--overwrite")
 			time.Sleep(2 * time.Second)
-			mustKubectl("label", "node", src, "soft-drain.io/drain-")
+			mustKubectl("label", "node", src, "soft-drain.com/drain-")
 			time.Sleep(2 * time.Second)
 		}
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true", "--overwrite")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true", "--overwrite")
 
 		Eventually(func() string { return nodeStateLabel(src) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
@@ -1234,7 +1234,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		origPod := podsOf(app)[0]
 
 		monitor := watchAvailability(map[string]int{app: 1})
-		mustKubectl("label", "node", worker, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
 		// 대체 Pod이 생기고, Ready가 못 되니 넘기기가 영영 일어나지 않는다
 		Eventually(func() []string { return replacementPods(app) },
@@ -1258,7 +1258,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		DeferCleanup(func() { cleanupDrain(src, app) })
 
 		monitor := watchAvailability(map[string]int{app: 1})
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 		Eventually(func() string { return nodeStateLabel(src) },
 			4*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -1279,7 +1279,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			_, _ = kubectl("delete", "pvc", "-n", "default", "sd-data", "--ignore-not-found", "--wait=false")
 		})
 
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
 		// PV의 노드 어피니티가 cordon된 노드를 가리켜 대체 Pod이 영영 Pending이다
 		Eventually(func(g Gomega) {
@@ -1292,7 +1292,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(podPhase(origPod)).To(Equal("Running"))
 		}, 30*time.Second, 5*time.Second).Should(Succeed())
 
-		mustKubectl("label", "node", src, "soft-drain.io/drain-")
+		mustKubectl("label", "node", src, "soft-drain.com/drain-")
 		Eventually(func(g Gomega) {
 			g.Expect(nodeStateLabel(src)).To(BeEmpty())
 			g.Expect(replacementPods(app)).To(BeEmpty())
@@ -1319,7 +1319,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			"-n", "default", "--timeout=120s")
 		mustKubectl("wait", "--for=condition=Ready", "pod/sd-naked", "-n", "default", "--timeout=120s")
 
-		mustKubectl("label", "node", worker, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
 		// 셋 다 타깃이 아니므로 노드는 곧바로 Complete가 된다
 		Eventually(func() string { return nodeStateLabel(worker) },
@@ -1352,7 +1352,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		})
 
 		monitor := watchAvailability(map[string]int{app: 2})
-		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 		Eventually(func() string { return nodeStateLabel(src) },
 			4*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -1366,6 +1366,57 @@ var _ = Describe("soft-drain", Ordered, func() {
 			for _, p := range pods {
 				g.Expect(podPhase(p)).To(Equal("Running"))
 			}
+		}, 60*time.Second, 3*time.Second).Should(Succeed())
+	})
+
+	It("kubectl 플러그인으로 걸고 취소해도 라벨 경로와 같다", func() {
+		const app = "sd-plugin"
+		plugin := filepath.Join(GinkgoT().TempDir(), "kubectl-soft_drain")
+		out, err := utils.Run(exec.Command("go", "build", "-o", plugin,
+			"github.com/rogeeoh/soft-drain/cmd/kubectl-soft_drain"))
+		Expect(err).NotTo(HaveOccurred(), out)
+
+		worker := pickWorker()
+		DeferCleanup(func() { cleanupDrain(worker, app) })
+
+		By("starting a stuck drain with --wait=false")
+		applyYAML(deployYAML(workload{name: app, pin: worker}))
+		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
+		out, err = utils.Run(exec.Command(plugin, worker, "--wait=false"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Eventually(func(g Gomega) {
+			g.Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
+			g.Expect(replacementPods(app)).To(HaveLen(1))
+		}, 60*time.Second, 2*time.Second).Should(Succeed())
+
+		By("cancelling with --cancel")
+		out, err = utils.Run(exec.Command(plugin, worker, "--cancel", "--timeout", "2m"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(nodeStateLabel(worker)).To(BeEmpty())
+		Expect(nodeUnschedulable(worker)).To(BeEmpty())
+		Eventually(func() []string { return replacementPods(app) },
+			60*time.Second, 2*time.Second).Should(BeEmpty())
+
+		By("draining to completion in blocking mode")
+		applyYAML(deployYAML(workload{name: app})) // 고정 해제 — 이제 갈 곳이 있다
+		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
+		var src string
+		Eventually(func(g Gomega) {
+			pods := podsOf(app)
+			g.Expect(pods).To(HaveLen(1))
+			src = nodeOfPod(pods[0])
+		}, 60*time.Second, 2*time.Second).Should(Succeed())
+		DeferCleanup(func() { cleanupDrainNode(src) })
+
+		out, err = utils.Run(exec.Command(plugin, src, "--timeout", "3m"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).To(ContainSubstring("drained"))
+		Expect(nodeStateLabel(src)).To(Equal("Complete"))
+		Eventually(func(g Gomega) {
+			pods := podsOf(app)
+			g.Expect(pods).To(HaveLen(1))
+			g.Expect(nodeOfPod(pods[0])).NotTo(Equal(src))
+			g.Expect(podPhase(pods[0])).To(Equal("Running"))
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 })
