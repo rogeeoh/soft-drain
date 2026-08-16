@@ -496,7 +496,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Pods:\n%s\n", pods)
 	})
 
-	It("워크로드를 다른 노드로 옮기고 Complete를 붙인다", func() {
+	It("moves the workload to another node and attaches Complete", func() {
 		const app = "sd-happy"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -529,7 +529,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("여러 Deployment를 한꺼번에 옮겨도 가용 개수가 의도 밑으로 떨어지지 않는다", func() {
+	It("moving several Deployments at once never drops availability below spec", func() {
 		apps := map[string]int{
 			"sd-multi-1": 1, "sd-multi-2": 1, "sd-multi-3": 1, "sd-multi-4": 1, "sd-multi-5": 1,
 			"sd-multi-ha": 2,
@@ -568,7 +568,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}
 	})
 
-	It("갈 곳이 없으면 Pending으로 기다리고, 라벨을 걷으면 되돌린다", func() {
+	It("waits in Pending with nowhere to go, restores when the label is removed", func() {
 		const app = "sd-pending"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -592,7 +592,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podsOf(app)).To(Equal([]string{origPod}))
 	})
 
-	It("uncordon하면 취소하고 Cancelled를 남긴다", func() {
+	It("uncordon cancels and leaves Cancelled", func() {
 		const app = "sd-cancel"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -616,7 +616,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podsOf(app)).To(Equal([]string{origPod}))
 	})
 
-	It("drain 중 롤링업데이트가 나도 새 템플릿으로 수렴한다", func() {
+	It("converges on the new template when a rolling update lands mid-drain", func() {
 		const app = "sd-rolling"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -645,7 +645,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("롤아웃이 타깃을 지우면 대체 Pod도 따라 사라진다", func() {
+	It("the replacement follows when a rollout prunes its target", func() {
 		const app = "sd-prune"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -664,7 +664,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("drain 중 Deployment가 지워져도 대체 Pod이 따라 사라진다", func() {
+	It("the replacement follows when the Deployment is deleted mid-drain", func() {
 		const app = "sd-delete"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -679,7 +679,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("drain 중 스케일업이 나도 대체 Pod은 타깃마다 하나다", func() {
+	It("scale-up mid-drain still means one replacement per target", func() {
 		const app = "sd-scaleup"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -695,7 +695,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
 	})
 
-	It("drain 중 스케일 0이 되면 대체 Pod도 사라지고 Complete가 된다", func() {
+	It("scale to zero mid-drain removes replacements and completes", func() {
 		const app = "sd-scalezero"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -710,7 +710,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("모든 워커를 drain하면 막히고, 하나를 되돌리면 풀린다", func() {
+	It("draining every worker deadlocks, restoring one unblocks", func() {
 		const app = "sd-alldrain"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -773,7 +773,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("사람이 미리 cordon한 노드는 끝나도 cordon 소유권이 사람에게 있다", func() {
+	It("a node a human cordoned first keeps human cordon ownership at the end", func() {
 		const app = "sd-precordon"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -799,7 +799,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(nodeUnschedulable(src)).To(Equal("true"))
 	})
 
-	It("Deployment 소속이 아닌 Pod은 건드리지 않는다", func() {
+	It("Pods not owned by a Deployment are untouched", func() {
 		const naked = "sd-naked"
 		worker := pickWorker()
 		DeferCleanup(func() {
@@ -821,7 +821,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podCost(naked)).To(BeEmpty())
 	})
 
-	It("연달아 두 번 drain해도 매번 옮기고 끝난다", func() {
+	It("two drains in a row each move and finish", func() {
 		const app = "sd-redrain"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -862,7 +862,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("unschedulable을 tolerate하는 워크로드는 착지한 대체 Pod을 지우며 반복한다", func() {
+	It("a workload tolerating unschedulable loops on landed replacements", func() {
 		const app = "sd-tolerate"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -892,7 +892,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 	// ─── 다중 replicas ───
 
-	It("r=3이 한 노드에 몰려 있어도 셋 다 무중단으로 옮긴다", func() {
+	It("r=3 packed on one node moves all three without downtime", func() {
 		const app = "sd-pack"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -917,7 +917,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("확산된 r=3에서 drain 노드의 Pod만 움직이고 나머지는 이름까지 그대로다", func() {
+	It("with r=3 spread out only the draining node's Pod moves, the rest keep their names", func() {
 		const app = "sd-spread"
 		applyYAML(deployYAML(workload{name: app, replicas: 3, antiAffinity: true}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -947,7 +947,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}
 	})
 
-	It("한 Deployment(r=2)가 걸친 두 노드를 동시에 drain해도 무중단이다", func() {
+	It("draining both nodes of an r=2 Deployment at once stays zero-downtime", func() {
 		const app = "sd-straddle"
 		applyYAML(deployYAML(workload{name: app, replicas: 2, antiAffinity: true}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -983,7 +983,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("antiAffinity가 포화되면 자리가 없어 Pending으로 막힌다", func() {
+	It("saturated antiAffinity leaves no seat and blocks in Pending", func() {
 		const app = "sd-full"
 		workers := allWorkers()
 		applyYAML(deployYAML(workload{name: app, replicas: len(workers), antiAffinity: true}))
@@ -1013,7 +1013,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 	// ─── 방해 행위자 ───
 
-	It("drain 중 컨트롤러가 재시작해도 이어서 하고 중복 생성이 없다", func() {
+	It("a controller restart mid-drain resumes without duplicates", func() {
 		const app = "sd-restart"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1038,7 +1038,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("컨트롤러가 죽어 있는 동안 붙인 라벨도 살아나면 처리한다", func() {
+	It("labels applied while the controller is down are handled once it returns", func() {
 		const app = "sd-offline"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1073,7 +1073,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("컨트롤러 자신이 있는 노드를 drain해도 스스로 이주하고 수렴한다", func() {
+	It("draining the controller's own node migrates itself and converges", func() {
 		managerPods := func() []string {
 			out := mustKubectl("get", "pods", "-n", namespace, "-l", "control-plane=controller-manager",
 				"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`)
@@ -1109,7 +1109,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("사용자가 대체 Pod을 지우면 다음 라운드가 다시 만든다", func() {
+	It("a hand-deleted replacement is recreated next round", func() {
 		const app = "sd-meddle"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1127,7 +1127,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
 	})
 
-	It("사용자가 cost 어노테이션을 지우면 다시 박는다", func() {
+	It("a hand-removed cost annotation is stamped again", func() {
 		const app = "sd-cost"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1142,7 +1142,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			60*time.Second, 3*time.Second).Should(Equal("-2147483648"))
 	})
 
-	It("paused Deployment는 Ready인 대체 Pod이 있어도 넘기지 않는다", func() {
+	It("a paused Deployment never receives a handover even with a Ready replacement", func() {
 		const app = "sd-paused"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1187,7 +1187,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("라벨을 붙였다 뗐다 반복해도 마지막 선언대로 수렴한다", func() {
+	It("label flapping converges on the last declaration", func() {
 		const app = "sd-flap"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1216,7 +1216,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 	// ─── 워크로드 다양성 ───
 
-	It("대체 Pod이 영영 Ready가 못 되면 원본을 절대 죽이지 않는다", func() {
+	It("a forever-unready replacement never costs the original its life", func() {
 		const app = "sd-noready"
 		worker := pickWorker()
 		DeferCleanup(func() {
@@ -1250,7 +1250,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			"availability dropped while replacement never became ready:\n%s", strings.Join(violations, "\n"))
 	})
 
-	It("기동이 느린 워크로드도 Ready를 기다렸다가 무중단으로 옮긴다", func() {
+	It("a slow-starting workload is moved without downtime after waiting for Ready", func() {
 		const app = "sd-slow"
 		applyYAML(deployYAML(workload{name: app, readyDelay: 20}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1267,7 +1267,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			"availability dropped during slow-start drain:\n%s", strings.Join(violations, "\n"))
 	})
 
-	It("로컬 PVC 워크로드는 문서의 한계대로 멈추지, 부서지지 않는다", func() {
+	It("a local-PVC workload stalls as documented instead of breaking", func() {
 		const app = "sd-pvc"
 		applyYAML(pvcYAML("sd-data"))
 		applyYAML(deployYAML(workload{name: app, pvc: "sd-data"}))
@@ -1300,7 +1300,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("StatefulSet, Job, naked Pod은 건드리지 않고 Complete가 된다", func() {
+	It("StatefulSets, Jobs and naked Pods are untouched and Complete still lands", func() {
 		worker := pickWorker()
 		DeferCleanup(func() {
 			_, _ = kubectl("delete", "statefulset", "-n", "default", "sd-sts", "--ignore-not-found", "--wait=false")
@@ -1337,7 +1337,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podCost(jobPods[0])).To(BeEmpty())
 	})
 
-	It("PDB가 있어도 eviction을 안 쓰므로 막히지 않고 무중단으로 끝난다", func() {
+	It("a PDB cannot block it since eviction is never used, still zero-downtime", func() {
 		const app = "sd-pdb"
 		applyYAML(deployYAML(workload{name: app, replicas: 2, antiAffinity: true}))
 		applyYAML(pdbYAML("sd-pdb", app))
@@ -1369,7 +1369,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("kubectl 플러그인으로 걸고 해제해도 라벨 경로와 같다", func() {
+	It("the kubectl plugin path equals the raw label path, start to release", func() {
 		const app = "sd-plugin"
 		plugin := filepath.Join(GinkgoT().TempDir(), "kubectl-soft_drain")
 		out, err := utils.Run(exec.Command("go", "build", "-o", plugin,
@@ -1477,7 +1477,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("Complete 후 uncordon하면 관여를 접고 그 노드 착지도 다시 허용한다", func() {
+	It("uncordon after Complete folds involvement and reopens the node for landings", func() {
 		const app = "sd-reopen"
 		workers := allWorkers()
 		Expect(len(workers)).To(BeNumerically(">=", 3))
