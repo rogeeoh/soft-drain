@@ -140,15 +140,23 @@ func (r *NodeReconciler) cancel(ctx context.Context, node *corev1.Node) error {
 func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Complete와 Cancelled는 래치다. drain 라벨이 걷힐 때까지 관여하지 않는다.
-	if node.Labels[LabelState] == StateComplete || node.Labels[LabelState] == StateCancelled {
+	// Cancelled는 래치다. drain 라벨이 걷힐 때까지 관여하지 않는다.
+	if node.Labels[LabelState] == StateCancelled {
 		return ctrl.Result{}, nil
 	}
 
-	// InProgress는 cordon을 확인한 뒤에만 붙는다. 그런데 unschedulable이 아니라면
-	// 누군가 uncordon한 것이고, 종료를 보장하던 전제가 사라졌다 — 취소한다.
-	if node.Labels[LabelState] == StateInProgress && !node.Spec.Unschedulable {
+	// InProgress와 Complete는 cordon을 확인한 뒤에만 붙는다. 그런데 unschedulable이
+	// 아니라면 누군가 uncordon한 것이다 — 진행 중이면 종료를 보장하던 전제가
+	// 사라졌고, 끝난 뒤면 cordon 소유권을 넘겨받은 사람이 노드를 다시 쓰기로 한
+	// 것이다. 어느 쪽이든 관여를 접는다.
+	state := node.Labels[LabelState]
+	if (state == StateInProgress || state == StateComplete) && !node.Spec.Unschedulable {
 		return ctrl.Result{}, r.cancel(ctx, node)
+	}
+
+	// Complete는 래치다. cordon이 유지되는 동안 관여하지 않는다.
+	if state == StateComplete {
+		return ctrl.Result{}, nil
 	}
 
 	// 1. 노드 마킹 — 우리가 실제로 값을 바꿨을 때만 어노테이션을 단다

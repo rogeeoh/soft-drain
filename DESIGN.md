@@ -74,7 +74,9 @@ release는 진행 중이면 취소가 되고 Complete면 관리 종료가 된다
 
 `drain` 라벨이 사라지면 되돌린다 — 우리 값이 박힌 `pod-deletion-cost`를 걷고, `cordoned-by-controller`가 있으면 uncordon하고, `state` 라벨을 지운다.
 
-**drain 중에 누가 uncordon하면 취소다.** `state`가 `InProgress`인데 노드가 `unschedulable`이 아니면 그렇게 된 것이다 — `InProgress`는 cordon을 확인한 뒤에만 붙기 때문에 이 조합이 곧 증거다. cordon은 종료를 보장하던 전제라서, 전제가 사라진 채 계속하지도 않고 다시 cordon해서 사람과 싸우지도 않는다. cost를 걷고 `state=Cancelled`를 붙인 뒤 손을 뗀다. 대체 Pod은 회수 경로가 걷는다. `Cancelled`는 `Complete`처럼 래치다 — 라벨을 걷으면 지워지고, 다시 하려면 라벨을 걷었다가 다시 붙인다.
+**누가 uncordon하면 관여를 접는다 — 진행 중이든 끝난 뒤든.** `state`가 `InProgress`나 `Complete`인데 노드가 `unschedulable`이 아니면 그렇게 된 것이다 — 두 상태 모두 cordon을 확인한 뒤에만 붙기 때문에 이 조합이 곧 증거다. 진행 중이라면 cordon은 종료를 보장하던 전제라서 전제가 사라진 채 계속할 수 없고, 끝난 뒤라면 cordon 소유권을 넘겨받은 사람이 노드를 다시 쓰기로 결정한 것이다. 어느 쪽이든 다시 cordon해서 사람과 싸우지 않는다. cost를 걷고 `state=Cancelled`를 붙인 뒤 손을 뗀다. 대체 Pod은 회수 경로가 걷는다. `Cancelled`는 래치다 — 라벨을 걷으면 지워지고, 다시 하려면 라벨을 걷었다가 다시 붙인다.
+
+`Complete`를 접지 않고 두면 그 노드가 삭제 자석이 된다. 방금 비워져 가장 한가한 노드가 열렸으니 스케줄러는 다른 drain의 대체 Pod을 정확히 거기 앉히고, 착지 검사는 앉는 족족 지운다. 클러스터가 작을수록 모든 drain이 그 노드로 빨려 들어간다.
 
 ### 2. 타깃 표시
 
@@ -156,7 +158,9 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 
 ### 5. 완료
 
-노드 위에 타깃이 하나도 없으면 `cordoned-by-controller` 어노테이션을 지우고 `state=Complete`를 붙인 뒤 Event를 낸다. 어노테이션을 지우는 것은 cordon의 소유권을 사람에게 넘긴다는 뜻이다. 이양은 단방향이다 — `Complete`가 붙은 노드에는 drain 라벨이 걷힐 때까지 관여하지 않는다. cordon된 노드에 새로 앉을 수 있는 건 `unschedulable`을 tolerate하는 Pod뿐인데, 그건 어차피 옮기지 못하는 부류다. 이게 없으면 완료를 확인하고 라벨을 정리한 사용자가 노드를 다시 열게 되고, 비워 둔 노드에 Pod이 몰린 채로 리부팅하게 된다.
+노드 위에 타깃이 하나도 없으면 `cordoned-by-controller` 어노테이션을 지우고 `state=Complete`를 붙인 뒤 Event를 낸다. 어노테이션을 지우는 것은 cordon의 소유권을 사람에게 넘긴다는 뜻이다. `Complete`는 래치다 — cordon이 유지되는 동안에는 drain 라벨이 걷힐 때까지 관여하지 않는다. cordon된 노드에 새로 앉을 수 있는 건 `unschedulable`을 tolerate하는 Pod뿐인데, 그건 어차피 옮기지 못하는 부류다. 이게 없으면 완료를 확인하고 라벨을 정리한 사용자가 노드를 다시 열게 되고, 비워 둔 노드에 Pod이 몰린 채로 리부팅하게 된다.
+
+소유권을 넘겨받은 사람이 uncordon하면 래치는 `Cancelled`로 접힌다(1번). 착지 금지도 함께 풀린다 — 리부팅하러 갈 노드라서 막았던 것인데, uncordon은 리부팅 안 간다는 선언이다. uncordon과 감지 사이의 짧은 창에서는 착지한 대체 Pod이 지워질 수 있지만, 다음 라운드가 새로 만든다.
 
 **완료 판정에는 terminating 타깃도 센다.** `deletionTimestamp`가 찍혀도 grace period 동안 계속 돈다. 여기서 빼면 아직 작업이 돌고 있는 노드에 `Complete`가 붙고, 그걸 보고 노드를 리부팅한 사람이 그 작업을 죽인다. 만들기에서는 빼고 완료 판정에서는 세는 이유가 이것이다.
 

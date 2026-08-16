@@ -1432,4 +1432,47 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(podPhase(pods[0])).To(Equal("Running"))
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
+
+	It("Complete 후 uncordon하면 관여를 접고 그 노드 착지도 다시 허용한다", func() {
+		const app = "sd-reopen"
+		workers := allWorkers()
+		Expect(len(workers)).To(BeNumerically(">=", 3))
+		reopened, src := workers[0], workers[1]
+		DeferCleanup(func() {
+			cleanupDrainNode(reopened)
+			cleanupDrain(src, app)
+		})
+
+		By("draining an empty node to Complete, then uncordoning it")
+		mustKubectl("label", "node", reopened, "soft-drain.com/drain=true")
+		Eventually(func() string { return nodeStateLabel(reopened) },
+			2*time.Minute, 2*time.Second).Should(Equal("Complete"))
+		mustKubectl("uncordon", reopened)
+		Eventually(func(g Gomega) {
+			g.Expect(nodeStateLabel(reopened)).To(Equal("Cancelled"))
+			g.Expect(nodeUnschedulable(reopened)).To(BeEmpty())
+		}, 60*time.Second, 2*time.Second).Should(Succeed())
+
+		By("draining a workload whose replacement can only land on the reopened node")
+		deployPackedOnNode(workload{name: app}, src)
+		for _, o := range workers {
+			if o != reopened && o != src {
+				mustKubectl("cordon", o)
+				DeferCleanup(func(node string) func() {
+					return func() { _, _ = kubectl("uncordon", node) }
+				}(o))
+			}
+		}
+		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
+
+		// 접기 전 규칙이라면 대체 Pod이 착지하는 족족 지워져 영원히 안 끝난다
+		Eventually(func() string { return nodeStateLabel(src) },
+			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
+		Eventually(func(g Gomega) {
+			pods := podsOf(app)
+			g.Expect(pods).To(HaveLen(1))
+			g.Expect(nodeOfPod(pods[0])).To(Equal(reopened))
+			g.Expect(podPhase(pods[0])).To(Equal("Running"))
+		}, 60*time.Second, 3*time.Second).Should(Succeed())
+	})
 })
