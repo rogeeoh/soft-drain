@@ -216,7 +216,7 @@ func listReplacements(targetUID types.UID) []corev1.Pod {
 }
 
 var _ = Describe("NodeReconciler", func() {
-	It("cordon하고 cost를 박고 대체 Pod을 만든다", func() {
+	It("cordons, stamps the cost, creates the replacement", func() {
 		f := setupFixture()
 
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
@@ -240,7 +240,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(repl.Spec.Containers[0].Image).To(Equal("nginx:1.15"))
 	})
 
-	It("Ready인 대체 Pod을 Healthy Deployment에서 넘긴다", func() {
+	It("hands a Ready replacement over when the Deployment is healthy", func() {
 		f := setupFixture()
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, true)
@@ -255,7 +255,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(got.Labels).NotTo(HaveKey(LabelReplaces))
 	})
 
-	It("Deployment가 Healthy가 아니면 넘기지 않는다", func() {
+	It("does not hand over while the Deployment is unhealthy", func() {
 		f := setupFixture()
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, true)
@@ -279,7 +279,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(got.Labels[LabelReplaces]).To(Equal(string(f.target.UID)))
 	})
 
-	It("drain 노드에 앉은 Ready 대체 Pod은 지우고 다음 라운드에 새로 만든다", func() {
+	It("deletes a replacement that landed on a draining node and recreates it next round", func() {
 		f := setupFixture()
 		repl := createReplacement(f, f.node.Name, true)
 		setDeployHealthy(f.deploy)
@@ -304,7 +304,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(live).To(Equal(1))
 	})
 
-	It("판정과 삭제 사이에 hash가 붙은 Pod은 지우지 않는다", func() {
+	It("refuses to delete a Pod that gained the hash between judgment and deletion", func() {
 		f := setupFixture()
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, true)
@@ -328,7 +328,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getPod(repl.Name).DeletionTimestamp).To(BeNil())
 	})
 
-	It("넘겼는데 타깃이 살아남으면 다음 라운드가 새 대체 Pod을 만든다", func() {
+	It("creates a fresh replacement next round when the target survives a handover", func() {
 		f := setupFixture()
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, true)
@@ -358,7 +358,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getPod(repl.Name).Labels).NotTo(HaveKey(LabelReplaces))
 	})
 
-	It("타깃이 없으면 Complete를 붙이고 cordon 소유권을 넘긴다", func() {
+	It("attaches Complete and hands cordon ownership over when no targets remain", func() {
 		rec := &fakeRecorder{}
 		r := &NodeReconciler{Client: k8sClient, Reader: k8sClient, Recorder: rec}
 		node := createNode(uniq("empty-node"), map[string]string{LabelDrain: "true"})
@@ -373,7 +373,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(rec.has("DrainComplete")).To(BeTrue())
 	})
 
-	It("Complete 래치: 그 후 타깃이 생겨도 관여하지 않는다", func() {
+	It("Complete latches: later targets are left alone", func() {
 		f := setupFixture()
 		// Complete 상태를 만든다: 타깃을 먼저 지우고(0 grace로 즉시) reconcile
 		Expect(k8sClient.Delete(ctx, f.target, client.GracePeriodSeconds(0))).To(Succeed())
@@ -391,7 +391,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(listReplacements(late.UID)).To(BeEmpty())
 	})
 
-	It("drain 중 uncordon되면 취소한다", func() {
+	It("cancels when uncordoned mid-drain", func() {
 		f := setupFixture()
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
@@ -417,7 +417,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getNode(f.node.Name).Spec.Unschedulable).To(BeFalse())
 	})
 
-	It("Complete 뒤 uncordon되면 관여를 접는다", func() {
+	It("folds involvement when uncordoned after Complete", func() {
 		f := setupFixture()
 		Expect(k8sClient.Delete(ctx, f.target, client.GracePeriodSeconds(0))).To(Succeed())
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
@@ -446,7 +446,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getNode(f.node.Name).Spec.Unschedulable).To(BeFalse())
 	})
 
-	It("drain 라벨이 사라지면 되돌린다", func() {
+	It("restores the node when the drain label disappears", func() {
 		f := setupFixture()
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
@@ -465,7 +465,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getPod(f.target.Name).Annotations).NotTo(HaveKey(AnnotationPodDeletionCost))
 	})
 
-	It("사람이 미리 cordon한 노드에는 어노테이션을 달지 않는다", func() {
+	It("adds no annotation to a node a human cordoned first", func() {
 		rec := &fakeRecorder{}
 		r := &NodeReconciler{Client: k8sClient, Reader: k8sClient, Recorder: rec}
 		node := createNode(uniq("pre-cordoned"), map[string]string{LabelDrain: "true"})
@@ -488,7 +488,7 @@ var _ = Describe("PodReconciler", func() {
 		return &PodReconciler{Client: k8sClient, Reader: k8sClient}
 	}
 
-	It("타깃이 없는 대체 Pod을 지운다", func() {
+	It("deletes a replacement without a target", func() {
 		repl := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      uniq("orphan"),
@@ -506,7 +506,7 @@ var _ = Describe("PodReconciler", func() {
 		Expect(apierrors.IsNotFound(gone)).To(BeTrue())
 	})
 
-	It("타깃이 drain 노드에 살아 있으면 유지하고 재판정을 예약한다", func() {
+	It("keeps a replacement whose target lives on a draining node and requeues", func() {
 		f := setupFixture()
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, false)
@@ -517,7 +517,7 @@ var _ = Describe("PodReconciler", func() {
 		Expect(getPod(repl.Name).DeletionTimestamp).To(BeNil())
 	})
 
-	It("Cancelled 노드의 대체 Pod은 지운다", func() {
+	It("deletes replacements of a Cancelled node", func() {
 		f := setupFixture()
 		node := getNode(f.node.Name)
 		node.Labels[LabelState] = StateCancelled
@@ -530,7 +530,7 @@ var _ = Describe("PodReconciler", func() {
 		Expect(getPod(repl.Name).DeletionTimestamp).NotTo(BeNil())
 	})
 
-	It("controller ownerRef가 있는 Pod은 건드리지 않는다", func() {
+	It("never touches a Pod with a controller ownerRef", func() {
 		f := setupFixture()
 		adopted := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
