@@ -173,7 +173,7 @@ capacity is a human decision.
 | eviction-webhook operators | hold evictions (429) while surging `replicas` | ~none | yes (`spec.replicas`) | CRD + admission webhook |
 | **soft-drain** | **create → adopt → let RS delete** | **none** | **no** | **one controller, label-only API** |
 
-The distinguishing choice: **soft-drain never fights another controller.** The move
+The design principle: **don't fight the controllers — enlist them.** The move
 is executed by the ReplicaSet that owns the Pod, so nothing races to undo it.
 `spec.replicas` is never written, so your HPA and your GitOps never see a diff. No
 webhook holds evictions, so nothing fails open and there is nothing extra to keep
