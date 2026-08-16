@@ -108,6 +108,14 @@ release는 진행 중이면 취소가 되고(uncordon 포함 복원) Complete면
 
 **죽은 대체 Pod은 있는 것으로 세지 않고, 지운다.** 노드 압력 eviction이나 kubelet admission 거부로 `Failed`가 된 Pod은 Ready가 될 수도 입양될 수도 없다. 살아 있는 것으로 세면 그 타깃이 영원히 멈춘다. Pod에는 재시작이 없어서(phase `Failed`는 터미널이고 `restartPolicy`는 컨테이너 얘기다) 복구는 새 Pod뿐인데, 세지 않고 지우지도 않으면 만들 때마다 시체가 쌓인다. 원인이 지속되면 만들고-죽고-지우기를 반복하다가 원인이 풀리는 순간 수렴한다.
 
+**drain 중인 노드에 앉은 대체 Pod도 세지 않고, 지운다.** cordon보다 스케줄이 먼저여서, 앉은 뒤에 그 노드에 drain이 걸리는 경우가 생긴다. Ready를 기다릴 이유가 없다 — Ready가 되어도 넘기면 비우려는 노드에 타깃이 하나 더 생길 뿐이라 결말은 삭제뿐이고, 그동안 자리만 먹는다. hash가 없어 어느 ReplicaSet의 자식도 아니므로 지워도 노출은 줄지 않고, 같은 라운드가 새로 만들면 스케줄러가 cordon을 피해 앉힌다. 지울 때 Warning Event를 남긴다.
+
+`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 새로 만든 Pod이 또 drain 노드에 앉을 수 있고, 그러면 만들고 지우기를 반복한다. cordon을 무시하도록 만든 워크로드이므로 우리가 `nodeAffinity`를 주입해 그 의도를 뒤집지 않는다. 반복되는 Warning Event가 옮길 수 없다는 사실을 보여준다.
+
+**타깃의 ReplicaSet이 Deployment의 현재 템플릿이 아니면 만들지 않고, 있으면 지운다.** 롤아웃이 그 타깃을 이미 대체하는 중이다 — 새 버전을 다른 노드에 올리고 Ready 후 타깃을 지우는, 우리가 하려던 일 그대로다. 우리 대체 Pod은 낙선한 버전을 짓는 잉여이고, Healthy(D)가 롤아웃 내내 넘기기를 막으므로 입양에 도달할 수도 없다. `pod-deletion-cost`는 타깃에 남아 있으므로 old ReplicaSet의 스케일다운이 drain 노드의 타깃부터 지운다. 지울 때 Normal Event를 남긴다. 판정은 Deployment의 `spec.template`과 타깃 ReplicaSet의 템플릿을 `pod-template-hash` 라벨만 빼고 비교한다(Deployment 컨트롤러의 EqualIgnoreHash와 같다) — 이미지 변경이든 `rollout restart`든, 템플릿이 바뀌는 모든 경우가 같은 길로 잡힌다. 단 `spec.paused`면 템플릿이 달라도 이 규칙을 적용하지 않는다 — 롤아웃이 실제로 움직이지 않아 "대체 중"이라는 전제가 깨진다. 대체는 평소처럼 유지되고 넘기기만 Healthy(D)에 걸려 미뤄지다가, 재개되는 순간 이 규칙이 잡는다.
+
+**두 삭제가 preconditions에 거부되면 라운드를 접는다.** 거부는 판정과 삭제 사이에 Pod이 변했다는 뜻이다. 낡은 명단으로 넘기기까지 진행하지 않고 짧은 requeue로 라운드를 끝내, 다음 라운드가 새 상태에서 처음부터 판정한다. 그래서 넘기기는 "drain 중인 노드에 앉은 대체"를 다시 검사할 필요가 없다.
+
 **이미 넘긴 것도 세지 않는다.** 넘기면서 `soft-drain.com/replaces` 라벨을 떼기 때문에 애초에 후보가 아니다. 그래서 넘겼는데 타깃이 살아남은 경우가 자연히 복구된다 — 넘기는 순간 `replicas`가 올라가면 초과분이 증설분에 흡수되어 아무것도 안 지워지는데, 다음 라운드가 "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
 
 **만드는 쪽과 지우는 쪽 양쪽에서 깨어나야 한다.** 노드에서 출발하는 순회만 있으면, ReplicaSet이 prune될 때 타깃 Pod도 같이 사라져서 순회할 대상이 없어지고 대체 Pod을 쳐다볼 일이 없어진다. 그래서 대체 Pod 자체를 키로 하는 경로가 따로 있어야 한다. 판정은 위 한 줄로 같다.
@@ -136,11 +144,7 @@ spec: <rs.spec.template.spec 그대로>
 
 붙일 hash는 **타깃 Pod의 ownerRef가 가리키는 ReplicaSet**에서 읽는다. Deployment를 거쳐 현재 ReplicaSet을 찾는 경로는 쓰지 않는다 — 대체 Pod은 타깃의 ReplicaSet 템플릿으로 만들어졌고, 롤아웃 중이면 그게 현재 ReplicaSet이 아닐 수 있다.
 
-넘기기 전에 두 가지를 본다.
-
-**대체 Pod이 어느 노드에 앉았는가.** drain 라벨이 붙은 노드면 넘기지 않고 지운다. 넘겨봐야 그 노드에 타깃이 하나 더 생길 뿐이다. 아직 hash가 없어 어느 ReplicaSet의 자식도 아니므로 지워도 노출은 줄지 않고, 다음 라운드가 새로 만들면 스케줄러가 cordon된 노드를 피해 앉힌다. 지울 때 Warning Event를 남긴다. cordon보다 스케줄이 먼저여서 나중에 drain이 걸린 노드에 앉아 있던 경우가 이걸로 풀린다.
-
-`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 새로 만든 Pod이 또 drain 노드에 앉을 수 있고, 그러면 만들고 지우기를 반복한다. cordon을 무시하도록 만든 워크로드이므로 우리가 `nodeAffinity`를 주입해 그 의도를 뒤집지 않는다. 반복되는 Warning Event가 옮길 수 없다는 사실을 보여준다.
+넘기기 전에 하나를 본다. drain 중인 노드에 앉은 대체는 3단계가 이미 지웠으므로 여기 오지 않는다.
 
 **사용자 Deployment가 Healthy한가.**
 
@@ -205,7 +209,7 @@ kubectl describe pod <Pending 인 것>
 
 스케줄러가 `PodScheduled=False`의 message에 이유를 그대로 써 둔다 — `0/12 nodes are available: 5 Insufficient cpu, 7 node(s) didn't match pod anti-affinity rules` 같은 식이다. 컨트롤러가 따로 진단을 만들지 않는 이유다.
 
-대체 Pod이 하나도 안 보이면 생성 자체가 거부된 것이다. `kubectl describe node <노드>`로 Event를 본다.
+대체 Pod이 하나도 안 보이면 생성이 거부됐거나(ResourceQuota, admission webhook), 롤아웃이 이주를 대신 수행 중이라 만들지 않는 것이다. 어느 쪽이든 `kubectl describe node <노드>`의 Event에 남는다.
 
 ## 알려진 한계
 
@@ -214,6 +218,5 @@ kubectl describe pod <Pending 인 것>
 - **`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 옮기지 못할 수 있다.** 대체 Pod이 drain 노드에 앉을 때마다 지우고 다시 만들기를 반복하고, 다른 노드에 앉는 운이 따라야 끝난다.
 - **입양 전 대체 Pod은 controller가 없어 PDB 집계를 흔든다.** 같은 라벨을 갖고 Ready라 `currentHealthy`에는 들어가는데 `expectedCount`에는 안 들어가서, 그동안 `disruptionsAllowed`가 1 늘어난다. PDB가 지키는 바닥 아래로 내려가지는 않는다. 같은 이유로 사용자 PDB에 `UnmanagedPods` Warning이 쌓인다.
 - **주인 없는 대체 Pod이 있는 노드는 Cluster Autoscaler가 축소하지 못한다.** 넘기기가 멈춘 상태로 오래 가면 그 노드가 컨솔리데이션에서 계속 빠진다.
-- **롤아웃과 겹치면 곧 버려질 대체 Pod을 만든다.** 롤아웃이 끝나면 타깃이 사라지면서 같이 지워지지만, 그동안 롤아웃의 `maxSurge`와 자리를 다툰다.
 - **사용자 Pod의 `pod-deletion-cost` 원래 값은 복원하지 않는다.**
 - **`pod-deletion-cost`가 필요하므로 Kubernetes 1.22 이상이어야 한다.**

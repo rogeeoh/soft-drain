@@ -22,6 +22,7 @@ package controller
 // - Pod 삭제는 kubelet이 없어 terminating에 머무니 deletionTimestamp로 단언한다.
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sync"
@@ -35,6 +36,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -66,6 +68,18 @@ func uniq(prefix string) string {
 }
 
 const testHash = "abc1234"
+
+// conflictOnDelete는 판정과 삭제 사이에 Pod이 변해 preconditions가 거부되는
+// 교차를 흉내 낸다.
+type conflictOnDelete struct{ client.Client }
+
+func (c *conflictOnDelete) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
+	return apierrors.NewConflict(schema.GroupResource{Resource: "pods"}, obj.GetName(),
+		fmt.Errorf("the object has been modified"))
+}
+
+// 롤아웃 스펙들이 템플릿을 이 이미지로 바꿔 세대를 밀어낸다
+const rolledImage = "nginx:1.16"
 
 type fixture struct {
 	node   *corev1.Node
@@ -279,7 +293,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(got.Labels[LabelReplaces]).To(Equal(string(f.target.UID)))
 	})
 
-	It("deletes a replacement that landed on a draining node and recreates it next round", func() {
+	It("deletes a replacement that landed on a draining node and recreates it in the same round", func() {
 		f := setupFixture()
 		repl := createReplacement(f, f.node.Name, true)
 		setDeployHealthy(f.deploy)
@@ -292,7 +306,55 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
 		Expect(f.rec.has("ReplacementOnDrainingNode")).To(BeTrue())
 
-		// terminating은 있는 것으로 세지 않으므로 다음 라운드가 새로 만든다
+		// terminating은 있는 것으로 세지 않으므로 지운 라운드가 바로 새로 만든다
+		var live int
+		for _, p := range listReplacements(f.target.UID) {
+			if p.DeletionTimestamp == nil {
+				live++
+			}
+		}
+		Expect(live).To(Equal(1))
+	})
+
+	It("deletes a pending replacement once its landing node starts draining", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		repl := createReplacement(f, other.Name, false)
+
+		// 앉은 노드가 멀쩡하면 Ready를 기다린다
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getPod(repl.Name).DeletionTimestamp).To(BeNil())
+
+		// 그 노드에 drain이 걸리면 Ready를 기다릴 이유가 없다
+		patch := mergePatch(map[string]any{
+			"metadata": map[string]any{"labels": map[string]any{LabelDrain: "true"}},
+		})
+		Expect(k8sClient.Patch(ctx, other, patch)).To(Succeed())
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		Expect(getPod(repl.Name).DeletionTimestamp).NotTo(BeNil())
+		Expect(f.rec.has("ReplacementOnDrainingNode")).To(BeTrue())
+	})
+
+	It("retires the replacement and pauses creation while a rollout supersedes the target", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		repl := createReplacement(f, other.Name, false)
+
+		// 이미지가 바뀌면 타깃의 RS는 현재 세대가 아니다
+		fresh := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
+		fresh.Spec.Template.Spec.Containers[0].Image = rolledImage
+		Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getPod(repl.Name).DeletionTimestamp).NotTo(BeNil())
+		Expect(f.rec.has("ReplacementSuperseded")).To(BeTrue())
+
+		// stale한 동안은 다시 만들지 않는다 — 이주는 롤아웃의 몫이다
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 		var live int
@@ -301,7 +363,78 @@ var _ = Describe("NodeReconciler", func() {
 				live++
 			}
 		}
+		Expect(live).To(Equal(0))
+
+		// 세대가 돌아오면 재개된다
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
+		fresh.Spec.Template.Spec.Containers[0].Image = "nginx:1.15"
+		Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		live = 0
+		for _, p := range listReplacements(f.target.UID) {
+			if p.DeletionTimestamp == nil {
+				live++
+			}
+		}
 		Expect(live).To(Equal(1))
+	})
+
+	It("keeps the replacement when the template changed but the Deployment is paused", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		repl := createReplacement(f, other.Name, false)
+
+		fresh := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
+		fresh.Spec.Paused = true
+		fresh.Spec.Template.Spec.Containers[0].Image = rolledImage
+		Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// paused면 롤아웃이 실제로 움직이지 않는다 — 대체는 평소처럼 유지된다
+		Expect(getPod(repl.Name).DeletionTimestamp).To(BeNil())
+		Expect(f.rec.has("ReplacementSuperseded")).To(BeFalse())
+	})
+
+	It("folds the round instead of handing over when a landing deletion is rejected", func() {
+		f := setupFixture()
+		f.r.Client = &conflictOnDelete{Client: k8sClient}
+		repl := createReplacement(f, f.node.Name, true)
+		setDeployHealthy(f.deploy)
+
+		res, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// 삭제가 거부된 낡은 명단이 넘기기로 흘러가지 않는다 — 라운드를 접고 재판정한다
+		got := getPod(repl.Name)
+		Expect(got.DeletionTimestamp).To(BeNil())
+		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
+		Expect(res.RequeueAfter).To(Equal(time.Second))
+	})
+
+	It("prefers retirement over handover for a Ready replacement of a superseded target", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		repl := createReplacement(f, other.Name, true)
+		setDeployHealthy(f.deploy)
+
+		fresh := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
+		fresh.Spec.Template.Spec.Containers[0].Image = rolledImage
+		Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
+
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// Ready였어도 입양이 아니라 삭제다 — Healthy(D)가 롤아웃 내내 넘기기를 막으므로
+		// 이 대체는 입양에 도달할 수 없는 Pod이다
+		got := getPod(repl.Name)
+		Expect(got.DeletionTimestamp).NotTo(BeNil())
+		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
+		Expect(f.rec.has("ReplacementSuperseded")).To(BeTrue())
 	})
 
 	It("refuses to delete a Pod that gained the hash between judgment and deletion", func() {

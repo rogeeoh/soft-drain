@@ -23,6 +23,7 @@ import (
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -96,6 +97,15 @@ func deploymentHealthy(d *appsv1.Deployment) bool {
 	return d.Status.ObservedGeneration >= d.Generation &&
 		d.Status.Replicas == d.Status.UpdatedReplicas &&
 		d.Status.AvailableReplicas >= ptr.Deref(d.Spec.Replicas, 1)
+}
+
+// templatesEqualIgnoreHash는 Deployment 컨트롤러의 EqualIgnoreHash와 같은 비교다.
+// pod-template-hash 라벨만 빼고 같으면 rs는 그 Deployment의 현재 세대다.
+func templatesEqualIgnoreHash(a, b *corev1.PodTemplateSpec) bool {
+	a2, b2 := a.DeepCopy(), b.DeepCopy()
+	delete(a2.Labels, LabelPodTemplateHash)
+	delete(b2.Labels, LabelPodTemplateHash)
+	return apiequality.Semantic.DeepEqual(a2, b2)
 }
 
 // buildReplacement는 rs.spec.template에서 대체 Pod을 만든다.

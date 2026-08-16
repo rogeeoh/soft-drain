@@ -664,6 +664,130 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
+	It("a template change mid-drain retires the stale replacement and the rollout moves the Pod", func() {
+		const app = "sd-supersede"
+		applyYAML(deployYAML(workload{name: app, readyDelay: 45}))
+		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
+		origPod := podsOf(app)[0]
+		srcNode := nodeOfPod(origPod)
+		DeferCleanup(func() { cleanupDrain(srcNode, app) })
+
+		mustKubectl("label", "node", srcNode, "soft-drain.com/drain=true")
+		var stale string
+		Eventually(func(g Gomega) {
+			repls := replacementPods(app)
+			g.Expect(repls).To(HaveLen(1))
+			stale = repls[0]
+		}, time.Minute, 2*time.Second).Should(Succeed())
+
+		By("changing the template while the replacement is far from Ready")
+		mustKubectl("patch", "deployment", "-n", "default", app, "--type=merge",
+			"-p", `{"spec":{"template":{"metadata":{"labels":{"rollout":"v2"}}}}}`)
+
+		// readiness 45초를 채우기 한참 전에 회수된다 — Ready를 기다렸다면 여기서 걸린다
+		Eventually(func(g Gomega) {
+			out, err := kubectl("get", "pod", "-n", "default", stale,
+				"-o", "jsonpath={.metadata.deletionTimestamp}")
+			if err != nil {
+				// 이미 완전히 사라진 경우만 통과 — 일시적 API 오류는 통과가 아니다
+				g.Expect(err.Error()).To(ContainSubstring("NotFound"))
+				return
+			}
+			g.Expect(strings.TrimSpace(out)).NotTo(BeEmpty())
+		}, 40*time.Second, 2*time.Second).Should(Succeed())
+
+		By("the rollout finishes the move and the drain completes without a new replacement")
+		Eventually(func(g Gomega) {
+			g.Expect(nodeStateLabel(srcNode)).To(Equal("Complete"))
+			pods := podsOf(app)
+			g.Expect(pods).To(HaveLen(1))
+			g.Expect(nodeOfPod(pods[0])).NotTo(Equal(srcNode))
+			g.Expect(podPhase(pods[0])).To(Equal("Running"))
+			g.Expect(replacementPods(app)).To(BeEmpty())
+		}, 4*time.Minute, 3*time.Second).Should(Succeed())
+	})
+
+	It("a pending replacement retires the moment its landing node starts draining", func() {
+		const app = "sd-landing"
+		applyYAML(deployYAML(workload{name: app, readyDelay: 45}))
+		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
+		srcNode := nodeOfPod(podsOf(app)[0])
+
+		// 착지를 결정론으로 만든다: land 하나만 남기고 나머지 워커는 손 cordon
+		var land string
+		var parked []string
+		for _, w := range allWorkers() {
+			switch {
+			case w == srcNode:
+			case land == "":
+				land = w
+			default:
+				parked = append(parked, w)
+			}
+		}
+		Expect(land).NotTo(BeEmpty())
+		for _, w := range parked {
+			mustKubectl("cordon", w)
+		}
+		DeferCleanup(func() {
+			for _, w := range parked {
+				_, _ = kubectl("uncordon", w)
+			}
+			cleanupDrainNode(land)
+			cleanupDrain(srcNode, app)
+		})
+
+		mustKubectl("label", "node", srcNode, "soft-drain.com/drain=true")
+		var repl string
+		Eventually(func(g Gomega) {
+			repls := replacementPods(app)
+			g.Expect(repls).To(HaveLen(1))
+			g.Expect(nodeOfPod(repls[0])).To(Equal(land))
+			repl = repls[0]
+		}, time.Minute, 2*time.Second).Should(Succeed())
+
+		By("draining the node the replacement landed on")
+		mustKubectl("label", "node", land, "soft-drain.com/drain=true")
+
+		// readiness 45초를 채우기 한참 전에 회수된다
+		Eventually(func(g Gomega) {
+			out, err := kubectl("get", "pod", "-n", "default", repl,
+				"-o", "jsonpath={.metadata.deletionTimestamp}")
+			if err != nil {
+				// 이미 완전히 사라진 경우만 통과 — 일시적 API 오류는 통과가 아니다
+				g.Expect(err.Error()).To(ContainSubstring("NotFound"))
+				return
+			}
+			g.Expect(strings.TrimSpace(out)).NotTo(BeEmpty())
+		}, 40*time.Second, 2*time.Second).Should(Succeed())
+
+		By("a fresh replacement exists with nowhere to go")
+		Eventually(func(g Gomega) {
+			var live []string
+			for _, p := range replacementPods(app) {
+				out, err := kubectl("get", "pod", "-n", "default", p,
+					"-o", "jsonpath={.metadata.deletionTimestamp}")
+				if err == nil && strings.TrimSpace(out) == "" {
+					live = append(live, p)
+				}
+			}
+			g.Expect(live).To(HaveLen(1))
+			g.Expect(live[0]).NotTo(Equal(repl))
+			// land에 잠깐 앉았다 회수되는 교차가 있어도 결국 Pending으로 수렴한다
+			g.Expect(podPhase(live[0])).To(Equal("Pending"))
+		}, time.Minute, 2*time.Second).Should(Succeed())
+
+		By("uncordoning a parked worker lets the drain converge")
+		mustKubectl("uncordon", parked[0])
+		Eventually(func(g Gomega) {
+			g.Expect(nodeStateLabel(srcNode)).To(Equal("Complete"))
+			pods := podsOf(app)
+			g.Expect(pods).To(HaveLen(1))
+			g.Expect(nodeOfPod(pods[0])).To(Equal(parked[0]))
+			g.Expect(podPhase(pods[0])).To(Equal("Running"))
+		}, 4*time.Minute, 3*time.Second).Should(Succeed())
+	})
+
 	It("the replacement follows when the Deployment is deleted mid-drain", func() {
 		const app = "sd-delete"
 		worker := pickWorker()

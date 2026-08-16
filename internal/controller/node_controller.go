@@ -198,8 +198,14 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := r.reconcileReplacements(ctx, node, targets, replsByUID); err != nil {
+	retry, err := r.reconcileReplacements(ctx, node, targets, replsByUID)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if retry {
+		// 판정과 삭제 사이에 세상이 바뀌었다. 낡은 명단으로 넘기기까지 가지 않고
+		// 라운드를 접는다. 다음 라운드가 새 상태에서 처음부터 판정한다.
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	if err := r.handOver(ctx, node, targets, replsByUID); err != nil {
 		return ctrl.Result{}, err
@@ -245,18 +251,77 @@ func (r *NodeReconciler) markTargets(ctx context.Context, targets []target) erro
 }
 
 // reconcileReplacements는 있어야 할 집합과 있는 집합을 맞춘다 (DESIGN.md 3단계).
-// 모자라면 만들고, 같은 타깃에 남으면 지운다.
-func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1.Node, targets []target, replsByUID map[string][]*corev1.Pod) error {
+// 모자라면 만들고, 같은 타깃에 남으면 지운다. drain 중인 노드에 앉았거나
+// 롤아웃에 밀린 대체도 여기서 지운다 — 어느 쪽도 입양에 도달할 수 없다.
+// 그 삭제가 preconditions에 거부되면 retry를 돌려 라운드를 접는다 — 낡은
+// 명단이 넘기기까지 흘러가지 않게 하고, 다음 라운드가 새 상태에서 판정한다.
+func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1.Node, targets []target, replsByUID map[string][]*corev1.Pod) (retry bool, err error) {
 	log := logf.FromContext(ctx)
+	drainingNodes := map[string]bool{node.Name: true}
+	deploys := map[types.NamespacedName]*appsv1.Deployment{}
 	for _, t := range targets {
 		// terminating 타깃은 ReplicaSet이 이미 스스로 대체를 만들고 있다.
 		// 남아 있던 대체 Pod은 회수 경로(PodReconciler)가 같은 판정으로 지운다.
 		if t.pod.DeletionTimestamp != nil {
 			continue
 		}
-		existing := replsByUID[string(t.pod.UID)]
+		uid := string(t.pod.UID)
+
+		// drain 중인 노드에 앉은 대체는 Ready 여부와 무관하게 지운다.
+		var kept []*corev1.Pod
+		for _, repl := range replsByUID[uid] {
+			landed, err := r.nodeDraining(ctx, drainingNodes, repl.Spec.NodeName)
+			if err != nil {
+				return false, err
+			}
+			if !landed {
+				kept = append(kept, repl)
+				continue
+			}
+			deleted, err := deleteReplacement(ctx, r.Client, repl)
+			if err != nil {
+				return false, err
+			}
+			if !deleted {
+				return true, nil
+			}
+			r.Recorder.Eventf(node, repl, corev1.EventTypeWarning, "ReplacementOnDrainingNode",
+				"DeleteReplacementPod",
+				"Deleted replacement Pod %s/%s that landed on draining node %s",
+				repl.Namespace, repl.Name, repl.Spec.NodeName)
+			log.Info("Deleted replacement Pod that landed on draining node",
+				"pod", repl.Namespace+"/"+repl.Name, "landedOn", repl.Spec.NodeName, "node", node.Name)
+		}
+		replsByUID[uid] = kept
+
+		// 타깃의 이주를 롤아웃이 대신 수행 중이면 대체를 지우고,
+		// 세대가 돌아올 때까지 만들지 않는다.
+		superseded, err := r.supersededByRollout(ctx, deploys, t.rs)
+		if err != nil {
+			return false, err
+		}
+		if superseded {
+			for _, repl := range kept {
+				deleted, err := deleteReplacement(ctx, r.Client, repl)
+				if err != nil {
+					return false, err
+				}
+				if !deleted {
+					return true, nil
+				}
+				r.Recorder.Eventf(node, repl, corev1.EventTypeNormal, "ReplacementSuperseded",
+					"DeleteReplacementPod",
+					"Deleted replacement Pod %s/%s superseded by a rollout of its Deployment",
+					repl.Namespace, repl.Name)
+				log.Info("Deleted replacement Pod superseded by a rollout",
+					"pod", repl.Namespace+"/"+repl.Name, "target", t.pod.Namespace+"/"+t.pod.Name, "node", node.Name)
+			}
+			replsByUID[uid] = nil
+			continue
+		}
+
 		switch {
-		case len(existing) == 0:
+		case len(kept) == 0:
 			repl := buildReplacement(t.rs, t.pod.UID)
 			if err := r.Create(ctx, repl); err != nil {
 				r.Recorder.Eventf(node, nil, corev1.EventTypeWarning, "ReplacementCreateRejected",
@@ -268,58 +333,36 @@ func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1
 			}
 			log.Info("Created replacement Pod",
 				"pod", repl.Namespace+"/"+repl.Name, "target", t.pod.Namespace+"/"+t.pod.Name, "node", node.Name)
-		case len(existing) > 1:
+		case len(kept) > 1:
 			// 제일 오래된 하나만 남긴다. 트림은 이 라운드의 넘기기가 방금 지운
 			// Pod을 다시 보지 않게 하기 위한 것이다.
-			for _, extra := range existing[1:] {
+			for _, extra := range kept[1:] {
 				if _, err := deleteReplacement(ctx, r.Client, extra); err != nil {
-					return err
+					return false, err
 				}
 			}
-			replsByUID[string(t.pod.UID)] = existing[:1]
+			replsByUID[uid] = kept[:1]
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // handOver는 Ready인 대체 Pod에 hash를 붙여 ReplicaSet이 데려가게 한다 (DESIGN.md 4단계).
 // Deployment마다 따로 판정하고 준비된 것부터 넘긴다.
 func (r *NodeReconciler) handOver(ctx context.Context, node *corev1.Node, targets []target, replsByUID map[string][]*corev1.Pod) error {
 	log := logf.FromContext(ctx)
-	drainingNodes := map[string]bool{node.Name: true}
 	healthyDeploys := map[types.NamespacedName]bool{}
 	for _, t := range targets {
 		if t.pod.DeletionTimestamp != nil {
 			continue
 		}
+		// drain 중인 노드에 앉은 대체는 reconcileReplacements가 이미 지웠다
 		existing := replsByUID[string(t.pod.UID)]
 		if len(existing) == 0 {
 			continue
 		}
 		repl := existing[0]
 		if !podReady(repl) {
-			continue
-		}
-
-		landedOnDraining, err := r.nodeDraining(ctx, drainingNodes, repl.Spec.NodeName)
-		if err != nil {
-			return err
-		}
-		if landedOnDraining {
-			// 넘겨봐야 그 노드에 타깃이 하나 더 생긴다. hash가 없어 아직 누구의
-			// 자식도 아니므로 지우고, 다음 라운드가 cordon을 피해 새로 만든다.
-			deleted, err := deleteReplacement(ctx, r.Client, repl)
-			if err != nil {
-				return err
-			}
-			if deleted {
-				r.Recorder.Eventf(node, repl, corev1.EventTypeWarning, "ReplacementOnDrainingNode",
-					"DeleteReplacementPod",
-					"Deleted replacement Pod %s/%s that landed on draining node %s",
-					repl.Namespace, repl.Name, repl.Spec.NodeName)
-				log.Info("Deleted replacement Pod that landed on draining node",
-					"pod", repl.Namespace+"/"+repl.Name, "landedOn", repl.Spec.NodeName, "node", node.Name)
-			}
 			continue
 		}
 
@@ -429,6 +472,34 @@ func (r *NodeReconciler) nodeDraining(ctx context.Context, cache map[string]bool
 	// 리부팅하러 갈 노드라 여전히 막는다.
 	cache[name] = drainActive(n)
 	return cache[name], nil
+}
+
+// supersededByRollout는 타깃의 이주를 롤아웃이 대신 수행 중인지 본다 (DESIGN.md 3단계).
+// paused면 템플릿이 달라도 롤아웃이 실제로 움직이지 않으므로 해당하지 않는다.
+func (r *NodeReconciler) supersededByRollout(ctx context.Context, cache map[types.NamespacedName]*appsv1.Deployment, rs *appsv1.ReplicaSet) (bool, error) {
+	ref := metav1.GetControllerOf(rs)
+	if ref == nil {
+		// collectTargets가 ownedByDeployment를 통과한 RS만 넘기므로 도달하지 않는다
+		return false, nil
+	}
+	key := types.NamespacedName{Namespace: rs.Namespace, Name: ref.Name}
+	d, ok := cache[key]
+	if !ok {
+		d = &appsv1.Deployment{}
+		if err := r.Reader.Get(ctx, key, d); err != nil {
+			if apierrors.IsNotFound(err) {
+				// Deployment가 사라지면 타깃도 곧 사라진다. 회수는 그 경로가 한다
+				d = nil
+			} else {
+				return false, err
+			}
+		}
+		cache[key] = d
+	}
+	if d == nil || d.Spec.Paused {
+		return false, nil
+	}
+	return !templatesEqualIgnoreHash(&d.Spec.Template, &rs.Spec.Template), nil
 }
 
 func (r *NodeReconciler) deployHealthy(ctx context.Context, cache map[types.NamespacedName]bool, rs *appsv1.ReplicaSet) (bool, error) {

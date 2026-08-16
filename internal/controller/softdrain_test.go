@@ -27,12 +27,14 @@ import (
 	"k8s.io/utils/ptr"
 )
 
+const fixtureHash = "5449d4d8c8"
+
 func rsFixture() *appsv1.ReplicaSet {
 	return &appsv1.ReplicaSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "aaa-5449d4d8c8",
 			Namespace: "default",
-			Labels:    map[string]string{"app": "aaa", LabelPodTemplateHash: "5449d4d8c8"},
+			Labels:    map[string]string{"app": "aaa", LabelPodTemplateHash: fixtureHash},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1", Kind: "Deployment", Name: "aaa", Controller: ptr.To(true),
 			}},
@@ -40,7 +42,7 @@ func rsFixture() *appsv1.ReplicaSet {
 		Spec: appsv1.ReplicaSetSpec{
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{"app": "aaa", LabelPodTemplateHash: "5449d4d8c8"},
+					Labels: map[string]string{"app": "aaa", LabelPodTemplateHash: fixtureHash},
 				},
 				Spec: corev1.PodSpec{
 					Containers: []corev1.Container{{Name: "app", Image: "nginx:1.15"}},
@@ -77,7 +79,7 @@ func TestBuildReplacement(t *testing.T) {
 		t.Errorf("spec not copied from rs template: %+v", pod.Spec)
 	}
 	// 원본 템플릿이 오염되면 다음 라운드가 hash 없는 템플릿으로 판정한다
-	if rs.Spec.Template.Labels[LabelPodTemplateHash] != "5449d4d8c8" {
+	if rs.Spec.Template.Labels[LabelPodTemplateHash] != fixtureHash {
 		t.Error("buildReplacement must not mutate rs.Spec.Template")
 	}
 }
@@ -333,5 +335,48 @@ func TestSortPodsByAge(t *testing.T) {
 	got := pods[0].Name + pods[1].Name + pods[2].Name
 	if got != "acb" {
 		t.Errorf("order = %q, want %q", got, "acb")
+	}
+}
+
+func TestTemplatesEqualIgnoreHash(t *testing.T) {
+	deployTpl := func() *corev1.PodTemplateSpec {
+		return &corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "aaa"}},
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{{Name: "app", Image: "nginx:1.15"}},
+			},
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate func(rsTpl *corev1.PodTemplateSpec)
+		want   bool
+	}{
+		// rs 템플릿에는 hash가 붙어 있어도 같은 세대다
+		{"same generation", func(*corev1.PodTemplateSpec) {}, true},
+		{"image changed", func(tpl *corev1.PodTemplateSpec) {
+			tpl.Spec.Containers[0].Image = "nginx:1.16"
+		}, false},
+		// rollout restart는 템플릿 어노테이션(restartedAt)만 바꾼다
+		{"rollout restart", func(tpl *corev1.PodTemplateSpec) {
+			tpl.Annotations = map[string]string{"kubectl.kubernetes.io/restartedAt": "2026-08-16T00:00:00Z"}
+		}, false},
+		{"env added", func(tpl *corev1.PodTemplateSpec) {
+			tpl.Spec.Containers[0].Env = []corev1.EnvVar{{Name: "X", Value: "1"}}
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rsTpl := deployTpl()
+			rsTpl.Labels[LabelPodTemplateHash] = fixtureHash
+			tt.mutate(rsTpl)
+			if got := templatesEqualIgnoreHash(deployTpl(), rsTpl); got != tt.want {
+				t.Errorf("templatesEqualIgnoreHash = %v, want %v", got, tt.want)
+			}
+			// 비교가 원본을 오염시키면 이후 라운드가 다른 판정을 한다
+			if rsTpl.Labels[LabelPodTemplateHash] != fixtureHash {
+				t.Error("comparison must not mutate its inputs")
+			}
+		})
 	}
 }
