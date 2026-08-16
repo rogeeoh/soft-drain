@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/rogeeoh/soft-drain/compare/v0.1.0...v0.2.0) (2026-08-16)
+
+
+### Features
+
+* retire doomed replacements early — rollout supersede and drained landings ([b3d2907](https://github.com/rogeeoh/soft-drain/commit/b3d290736a18df12a35ffb14bd47ce46ac7f41e8))
+
 ## 0.1.0 (2026-08-16)
 
 
