@@ -60,19 +60,24 @@ rebooting or deleting it afterwards is your call, not soft-drain's.
 
 ### kubectl plugin
 
-A thin wrapper with `kubectl drain`-like ergonomics — it writes the label above and
-watches the rest:
+A thin wrapper with `git stash`-style grammar — the bare node form mirrors
+`kubectl drain NODE`, and everything else is a subcommand. It writes the label above
+and watches the rest:
 
 ```bash
 make plugin && cp bin/kubectl-soft_drain ~/bin/   # anywhere on your PATH
 
 kubectl soft-drain node-01                # label + progress until Complete
 kubectl soft-drain node-01 --wait=false   # label only
-kubectl soft-drain node-01 --cancel       # remove the label, wait for restore
+kubectl soft-drain status                 # every node under soft-drain (-o json|yaml)
+kubectl soft-drain release node-01        # remove the label, wait for restore
 ```
 
-On `--timeout` it prints the pending replacement Pods and their scheduler messages, so
-a stuck drain diagnoses itself.
+`release` cancels an in-flight drain and retires a completed one — both are the same
+label removal. (`kubectl uncordon` also cancels, but leaves the label and a
+`Cancelled` latch; `release` removes both.) On `--timeout` the plugin prints the
+pending replacement Pods and their scheduler messages, so a stuck drain diagnoses
+itself.
 
 ## Installation
 

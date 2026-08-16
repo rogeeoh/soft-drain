@@ -36,16 +36,18 @@ kubectl uncordon node-01                                 # 이것도 취소다 (
 
 ### kubectl 플러그인
 
-`kubectl soft-drain`은 위 네 줄의 포장이다. **쓰는 것은 drain 라벨 하나뿐이고 나머지는 읽기다** — 서버 쪽 표면은 늘지 않는다.
+`kubectl soft-drain`은 위 네 줄의 포장이다. **쓰는 것은 drain 라벨 하나뿐이고 나머지는 읽기다** — 서버 쪽 표면은 늘지 않는다. 문법은 `git stash`형이다 — 맨몸+노드가 주 동작이고, 나머지는 서브커맨드다. `status`와 `release`는 예약어다.
 
 ```
-kubectl soft-drain node-01                 # 라벨을 붙이고 Complete까지 진행을 보여준다
-kubectl soft-drain node-01 --wait=false    # 라벨만 붙이고 돌아온다
-kubectl soft-drain node-01 --timeout 30m   # 기본 0 = 무한
-kubectl soft-drain node-01 --cancel        # 라벨을 걷고 복원을 기다린다
+kubectl soft-drain node-01                 # 라벨을 붙이고 Complete까지 진행을 보여준다 (--wait=false, --timeout)
+kubectl soft-drain status                  # 현황판: 관여 중인 노드·남은 타깃·대체 Pod
+kubectl soft-drain status node-01 -o json  # 특정 노드, 기계용 (json|yaml)
+kubectl soft-drain release node-01         # 라벨을 걷고 복원을 기다린다
 ```
 
-`--timeout`이 터지면 Pending 대체 Pod과 스케줄러 메시지를 보여주고 0이 아닌 코드로 나간다 — "막혔을 때 보는 법"의 자동화다. 중간에 끊어도 라벨은 남으므로 drain은 계속된다. `state=Cancelled`인 노드에 다시 걸면 라벨을 걷어 복원시킨 뒤 다시 붙인다.
+release는 진행 중이면 취소가 되고 Complete면 관리 종료가 된다 — 실체는 같은 라벨 제거다. `kubectl uncordon`도 취소지만 라벨과 Cancelled 래치가 남는 점이 다르다 — release는 전부 걷는다. `--timeout`이 터지면 Pending 대체 Pod과 스케줄러 메시지를 보여주고 0이 아닌 코드로 나간다 — "막혔을 때 보는 법"의 자동화다. 중간에 끊어도 라벨은 남으므로 drain은 계속된다. `state=Cancelled`인 노드에 다시 drain을 걸면 라벨을 걷어 복원시킨 뒤 다시 붙인다.
+
+현황판에 "언제부터"는 없다 — 컨트롤러가 무기억이라 시작 시각을 어디에도 기록하지 않는다. `-o`의 몫은 플러그인만 계산할 수 있는 집계(타깃·대체 Pod 상태·스케줄러 메시지)다. 노드명 목록이 필요한 기계는 라벨 조회가 정석이다: `kubectl get nodes -l soft-drain.com/state=Complete -o name`.
 
 `kubectl drain`의 `--ignore-daemonsets`, `--delete-emptydir-data`, `--force`는 없다. eviction 전제의 개념이라 여기 해당이 없다.
 
