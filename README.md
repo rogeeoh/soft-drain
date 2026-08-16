@@ -76,9 +76,24 @@ a stuck drain diagnoses itself.
 
 ## Installation
 
+With Helm:
+
+```bash
+helm install soft-drain oci://ghcr.io/rogeeoh/charts/soft-drain \
+  --namespace soft-drain-system --create-namespace
+```
+
+With plain manifests (attached to each [release](https://github.com/rogeeoh/soft-drain/releases)):
+
+```bash
+kubectl apply -f https://github.com/rogeeoh/soft-drain/releases/latest/download/install.yaml
+```
+
+From source:
+
 ```bash
 git clone https://github.com/rogeeoh/soft-drain && cd soft-drain
-make deploy IMG=<your-registry>/soft-drain:latest
+make deploy
 ```
 
 Requires Kubernetes ≥ 1.22 (`pod-deletion-cost`).
@@ -101,7 +116,7 @@ capacity is a human decision.
 
 ## Compared to the alternatives
 
-| | mechanism | r=1 downtime | touches workload spec | server-side footprint |
+| approach | mechanism | r=1 downtime | touches workload spec | server-side footprint |
 |---|---|---|---|---|
 | `kubectl drain` | evict, then recover | yes | no | none |
 | cordon + `rollout restart` scripts | restart the whole Deployment | ~none | yes (template annotation) | none |

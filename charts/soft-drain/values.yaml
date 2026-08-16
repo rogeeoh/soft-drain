@@ -1,0 +1,21 @@
+image:
+  repository: ghcr.io/rogeeoh/soft-drain
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+replicas: 1
+
+leaderElect: true
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 128Mi
+  requests:
+    cpu: 10m
+    memory: 64Mi
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
