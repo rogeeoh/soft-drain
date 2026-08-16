@@ -1,0 +1,10 @@
+apiVersion: v2
+name: soft-drain
+description: Drain Kubernetes nodes without dropping a single replica — even for replicas:1 Deployments
+type: application
+home: https://github.com/rogeeoh/soft-drain
+sources:
+  - https://github.com/rogeeoh/soft-drain
+# version and appVersion are overridden at release time from the git tag.
+version: 0.0.0
+appVersion: 0.0.0

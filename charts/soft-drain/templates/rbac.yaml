@@ -1,0 +1,68 @@
+# Mirrors config/rbac (kubebuilder-generated). Keep in sync when RBAC markers change.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "soft-drain.fullname" . }}
+  labels:
+    {{- include "soft-drain.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list, patch, update, watch]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [create, delete, get, list, patch, watch]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [events.k8s.io]
+    resources: [events]
+    verbs: [create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "soft-drain.fullname" . }}
+  labels:
+    {{- include "soft-drain.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "soft-drain.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "soft-drain.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.leaderElect }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "soft-drain.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "soft-drain.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [coordination.k8s.io]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "soft-drain.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "soft-drain.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "soft-drain.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "soft-drain.fullname" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
