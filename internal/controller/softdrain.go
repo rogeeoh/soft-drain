@@ -31,11 +31,11 @@ import (
 )
 
 const (
-	LabelDrain    = "soft-drain.io/drain"
-	LabelState    = "soft-drain.io/state"
-	LabelReplaces = "soft-drain.io/replaces"
+	LabelDrain    = "soft-drain.com/drain"
+	LabelState    = "soft-drain.com/state"
+	LabelReplaces = "soft-drain.com/replaces"
 
-	AnnotationCordoned        = "soft-drain.io/cordoned-by-controller"
+	AnnotationCordoned        = "soft-drain.com/cordoned-by-controller"
 	AnnotationPodDeletionCost = "controller.kubernetes.io/pod-deletion-cost"
 
 	// int32 최솟값. 이 값을 쓰는 게 우리뿐이라 값이 이것이면 우리가 붙인 것이다.

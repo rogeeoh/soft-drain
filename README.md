@@ -1,135 +1,153 @@
 # soft-drain
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+Drain Kubernetes nodes without dropping a single replica — even for `replicas: 1` Deployments.
 
-## Getting Started
+`kubectl drain` evicts first and lets the workload recover later. For a single-replica
+Deployment that means downtime on every node maintenance; a PDB only turns the downtime
+into a stuck drain. The upstream feature request to surge before draining was
+[closed as not planned](https://github.com/kubernetes/kubernetes/issues/114877).
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+soft-drain does it the other way around: **it brings a new Pod up first, waits until it
+is Ready, and only then lets the old one go.** Capacity never dips.
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## How it works
 
-```sh
-make docker-build docker-push IMG=<some-registry>/soft-drain:tag
+A ReplicaSet has two documented behaviors:
+
+1. It adopts an ownerless Pod that matches its selector.
+2. When it has more children than `replicas`, it deletes the one with the lowest
+   [`pod-deletion-cost`](https://kubernetes.io/docs/reference/labels-annotations-taints/#pod-deletion-cost) first.
+
+soft-drain chains the two:
+
+```mermaid
+flowchart LR
+    A["clone target Pod<br/>without pod-template-hash<br/>(invisible to the ReplicaSet)"]
+    B["wait until Ready<br/>(already serving via Service)"]
+    C["one patch:<br/>attach pod-template-hash"]
+    D["ReplicaSet adopts it,<br/>sees a surplus, deletes the<br/>old Pod (lowest deletion cost)"]
+    A --> B --> C --> D
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+**The ReplicaSet moves the Pod. soft-drain just sets the table.** No eviction API, no
+PDB interaction, no Deployment spec changes — the only thing written to your workload
+is one annotation on the outgoing Pod.
 
-**Install the CRDs into the cluster:**
+Because `pod-template-hash` is part of the ReplicaSet selector but not the Service
+selector, the replacement starts serving the moment it is Ready and never drops out of
+Endpoints during adoption.
 
-```sh
-make install
+## Usage
+
+The API is a node label. That's all of it.
+
+```bash
+kubectl label node node-01 soft-drain.com/drain=true      # start
+kubectl get nodes -l soft-drain.com/state=Complete        # check
+kubectl label node node-01 soft-drain.com/drain-          # cancel
+kubectl uncordon node-01                                  # also cancels
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+The controller cordons the node, moves every Deployment-owned Pod as described above,
+then labels the node `soft-drain.com/state=Complete`. The node stays cordoned —
+rebooting or deleting it afterwards is your call, not soft-drain's.
 
-```sh
-make deploy IMG=<some-registry>/soft-drain:tag
+| Node state label | Meaning |
+|---|---|
+| `InProgress` | Pods are being moved |
+| `Complete` | Every Deployment Pod has left; the node stays cordoned |
+| `Cancelled` | Someone uncordoned the node mid-drain; soft-drain backed off |
+
+### kubectl plugin
+
+A thin wrapper with `kubectl drain`-like ergonomics — it writes the label above and
+watches the rest:
+
+```bash
+make plugin && cp bin/kubectl-soft_drain ~/bin/   # anywhere on your PATH
+
+kubectl soft-drain node-01                # label + progress until Complete
+kubectl soft-drain node-01 --wait=false   # label only
+kubectl soft-drain node-01 --cancel       # remove the label, wait for restore
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
+On `--timeout` it prints the pending replacement Pods and their scheduler messages, so
+a stuck drain diagnoses itself.
 
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
+## Installation
 
-```sh
-kubectl apply -k config/samples/
+```bash
+git clone https://github.com/rogeeoh/soft-drain && cd soft-drain
+make deploy IMG=<your-registry>/soft-drain:latest
 ```
 
->**NOTE**: Ensure that the samples has default values to test it out.
+Requires Kubernetes ≥ 1.22 (`pod-deletion-cost`).
 
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
+## What it guarantees — and what it doesn't
 
-```sh
-kubectl delete -k config/samples/
+**Guaranteed:** available replicas never drop below `spec.replicas` because of the
+drain. New capacity is always Ready before old capacity is removed, and handover is
+gated on the Deployment being healthy (no rollout in flight, availability at spec).
+
+**Not guaranteed:** *which* Pod dies. `pod-deletion-cost` is a hint, fourth in the
+deletion sort order. If an unrelated Pod happens to be NotReady at handover time the
+ReplicaSet may delete that one instead — exposure still never dips, and the remaining
+target is retried next round.
+
+**Scope:** Deployment-owned Pods only. StatefulSets, DaemonSets, Jobs, and bare Pods
+are left untouched — `Complete` means "my share is done", not "the node is empty".
+When there is no room for a replacement, it stays Pending and the drain waits; freeing
+capacity is a human decision.
+
+## Compared to the alternatives
+
+| | mechanism | r=1 downtime | touches workload spec | server-side footprint |
+|---|---|---|---|---|
+| `kubectl drain` | evict, then recover | yes | no | none |
+| cordon + `rollout restart` scripts | restart the whole Deployment | ~none | yes (template annotation) | none |
+| descheduler / migration controllers | evict with resource reservation | yes (delete-first) | no | CRDs |
+| eviction-webhook operators | hold evictions (429) while surging `replicas` | ~none | yes (`spec.replicas`) | CRD + admission webhook |
+| **soft-drain** | **create → adopt → let RS delete** | **none** | **no** | **one controller, label-only API** |
+
+The distinguishing choices: no webhook (nothing fails open, nothing to keep highly
+available), no CRD (a label is the entire API), no writes to contested fields
+(`spec.replicas` belongs to you, your HPA, and your GitOps — not to us), and a
+memoryless reconciler (every decision is recomputed from cluster state, so controller
+restarts are non-events).
+
+## Known limitations
+
+- **No spare capacity, no progress.** Room appears only when the old Pod dies, and the
+  old Pod dies only after the new one is Ready. At 100% utilization the drain waits.
+- Workloads that cap themselves at one Pod per node with required `podAntiAffinity`
+  on a full cluster cannot surge — same arithmetic as `maxSurge: 1` rollouts.
+- Workloads tolerating `node.kubernetes.io/unschedulable` may land replacements back
+  on the draining node; soft-drain deletes and retries (with a Warning event each time)
+  rather than overriding the toleration with an injected affinity.
+- Pre-adoption replacements are ownerless, which nudges PDB accounting
+  (`disruptionsAllowed` +1 while they exist) and blocks Cluster Autoscaler
+  consolidation of the node they run on.
+- The original `pod-deletion-cost` value of a target Pod is not restored.
+
+## Testing
+
+Three tiers, all green:
+
+- **unit** — pure judgment functions
+- **envtest** — everything the controller writes to the API server, including
+  hand-arranged race interleavings (judge-vs-delete, adopt-vs-recreate)
+- **kind e2e — 31 scenarios** with continuous availability probes: multi-Deployment
+  simultaneous drains, both cancel paths, rollout overlap, controller restart and
+  controller absence mid-drain, manual meddling (deleting replacements, stripping
+  costs), permanently-NotReady replacements, full-cluster drain deadlock and release,
+  PDB coexistence, and the controller draining **its own node**
+
+```bash
+make test        # unit + envtest
+make test-e2e    # kind cluster, ~15 min
 ```
 
-**Delete the APIs(CRDs) from the cluster:**
+## Design
 
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/soft-drain:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/soft-drain/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
-
-## License
-
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+The full design rationale lives in [DESIGN.md](DESIGN.md) (Korean; English translation
+planned). It is the source of truth for how the controller behaves.

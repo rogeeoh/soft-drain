@@ -17,7 +17,7 @@ jobs:
         with:
           go-version-file: go.mod
 
+      # .golangci.yml uses the logcheck module plugin, which the stock binary
+      # cannot load. make lint builds a custom golangci-lint with the plugin.
       - name: Run linter
-        uses: golangci/golangci-lint-action@v8
-        with:
-          version: v2.8.0
+        run: make lint
