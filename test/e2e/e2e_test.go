@@ -1389,6 +1389,19 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(replacementPods(app)).To(HaveLen(1))
 		}, 60*time.Second, 2*time.Second).Should(Succeed())
 
+		By("cancelling via uncordon, then re-draining through the plugin")
+		mustKubectl("uncordon", worker)
+		Eventually(func() string { return nodeStateLabel(worker) },
+			60*time.Second, 2*time.Second).Should(Equal("Cancelled"))
+		// Cancelled 래치는 플러그인이 걷고 다시 건다 — 재drain은 새 drain과 같다
+		out, err = utils.Run(exec.Command(plugin, worker, "--wait=false", "--timeout", "2m"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).To(ContainSubstring("clearing it first"))
+		Eventually(func(g Gomega) {
+			g.Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
+			g.Expect(replacementPods(app)).To(HaveLen(1))
+		}, 60*time.Second, 2*time.Second).Should(Succeed())
+
 		By("checking status output, human and machine")
 		out, err = utils.Run(exec.Command(plugin, "status"))
 		Expect(err).NotTo(HaveOccurred(), out)
