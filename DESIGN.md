@@ -36,7 +36,7 @@ kubectl uncordon node-01                                 # 이것도 취소다 (
 
 ### kubectl 플러그인
 
-`kubectl soft-drain`은 위 네 줄의 포장이다. **쓰는 것은 drain 라벨 하나뿐이고 나머지는 읽기다** — 서버 쪽 표면은 늘지 않는다. 문법은 `git stash`형이다 — 맨몸+노드가 주 동작이고, 나머지는 서브커맨드다. `status`와 `release`는 예약어다.
+`kubectl soft-drain`은 위 네 줄의 포장이다. **쓰는 것은 drain 라벨 하나뿐이고 나머지는 읽기다** — 서버 쪽 표면은 늘지 않는다. 문법은 `git stash`형이다 — 맨몸+노드가 주 동작이고, 나머지는 서브커맨드다. `status`, `release`, `version`은 예약어다.
 
 ```
 kubectl soft-drain node-01 [node-02 ...]   # 라벨을 붙이고 전부 Complete될 때까지 진행을 보여준다 (--wait=false, --timeout)

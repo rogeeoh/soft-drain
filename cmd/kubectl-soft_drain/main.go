@@ -27,11 +27,23 @@ import (
 
 const pollInterval = 2 * time.Second
 
+// version은 빌드 시 -ldflags "-X main.version=..."로 주입된다.
+var version = "dev"
+
 func main() {
-	if err := run(); err != nil {
-		fmt.Fprintln(os.Stderr, "error:", err)
-		os.Exit(1)
+	err := run()
+	if err == nil {
+		return
 	}
+	// Ctrl-C는 실패가 아니라 분리다 — 라벨은 남고 작업은 계속된다.
+	// 종료코드 130(128+SIGINT)으로 "완주 안 됨"만 관례대로 알린다.
+	if errors.Is(err, context.Canceled) {
+		fmt.Fprintln(os.Stderr, "interrupted; the operation keeps running on the cluster (labels remain)")
+		fmt.Fprintln(os.Stderr, "check with: kubectl soft-drain status")
+		os.Exit(130)
+	}
+	fmt.Fprintln(os.Stderr, "error:", err)
+	os.Exit(1)
 }
 
 func run() error {
@@ -66,8 +78,9 @@ func run() error {
   kubectl soft-drain NODE...           start soft drains and watch until Complete
   kubectl soft-drain status [NODE...]  show nodes under soft-drain (-o json|yaml)
   kubectl soft-drain release NODE...   remove drain labels and wait for restore
+  kubectl soft-drain version           print the plugin version
 
-"status" and "release" are reserved words. kubectl uncordon also cancels an
+"status", "release" and "version" are reserved words. kubectl uncordon also cancels an
 in-flight drain but leaves the label and a Cancelled latch; release removes
 the label and restores the node fully.
 
@@ -83,6 +96,11 @@ the label and restores the node fully.
 		flags.Usage()
 		return nil
 	}
+	// version은 클러스터 없이도 답해야 한다 — 클라이언트 생성보다 먼저 본다.
+	if args[0] == "version" {
+		fmt.Printf("kubectl-soft_drain %s\n", version)
+		return nil
+	}
 
 	restCfg, err := cfg.ToRESTConfig()
 	if err != nil {
@@ -93,29 +111,36 @@ the label and restores the node fully.
 		return err
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	sigCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	ctx := sigCtx
 	if *timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, *timeout)
 		defer cancel()
 	}
 
+	var err2 error
 	switch args[0] {
 	case "status":
-		return runStatus(ctx, cs, args[1:], *output)
+		err2 = runStatus(ctx, cs, args[1:], *output)
 	case "release":
 		if len(args) < 2 {
 			flags.Usage()
 			return errors.New("release takes at least one node name")
 		}
-		return runRelease(ctx, cs, args[1:], *waitDone)
+		err2 = runRelease(ctx, cs, args[1:], *waitDone)
 	default:
 		if *output != "" {
 			return errors.New("-o is only valid with status")
 		}
-		return runDrain(ctx, cs, args, *waitDone)
+		err2 = runDrain(ctx, cs, args, *waitDone)
 	}
+	// 어느 지점에서 끊겼든, 신호가 원인이면 실패가 아니라 분리다.
+	if err2 != nil && sigCtx.Err() != nil {
+		return context.Canceled
+	}
+	return err2
 }
 
 type podRef struct {
@@ -319,7 +344,7 @@ func watchDrains(ctx context.Context, cs kubernetes.Interface, nodes []string) e
 				}
 				return errors.New("timed out waiting; the drains keep running (labels remain)")
 			}
-			return errors.New("interrupted; the drains keep running (labels remain)")
+			return ctx.Err()
 		case <-ticker.C:
 		}
 
