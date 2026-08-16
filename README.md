@@ -10,6 +10,10 @@ into a stuck drain. The upstream feature request to surge before draining was
 soft-drain does it the other way around: **it brings a new Pod up first, waits until it
 is Ready, and only then lets the old one go.** Capacity never dips.
 
+It was born operating on-premise GPU clusters — where nodes need hands-on maintenance,
+capacity is too expensive to double for HA, and single-replica inference servers are
+the norm. Nothing about it is GPU-specific, though: it works for any Deployment.
+
 ## How it works
 
 A ReplicaSet has two documented behaviors:
