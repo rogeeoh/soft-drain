@@ -1410,6 +1410,32 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), out)
 		Expect(out).NotTo(ContainSubstring(worker))
 
+		By("draining and releasing two empty nodes in one call")
+		var two []string
+		for _, o := range allWorkers() {
+			if o != worker && len(two) < 2 {
+				two = append(two, o)
+			}
+		}
+		Expect(two).To(HaveLen(2))
+		DeferCleanup(func() {
+			for _, o := range two {
+				cleanupDrainNode(o)
+			}
+		})
+		out, err = utils.Run(exec.Command(plugin, two[0], two[1], "--timeout", "2m"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		for _, o := range two {
+			Expect(nodeStateLabel(o)).To(Equal("Complete"))
+		}
+		out, err = utils.Run(exec.Command(plugin, "release", two[0], two[1], "--timeout", "2m"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		for _, o := range two {
+			Expect(nodeStateLabel(o)).To(BeEmpty())
+			// Complete에서 걷으면 cordon은 남는다 — 소유권이 이미 사람에게 넘어왔다
+			Expect(nodeUnschedulable(o)).To(Equal("true"))
+		}
+
 		By("draining to completion in blocking mode")
 		applyYAML(deployYAML(workload{name: app})) // 고정 해제 — 이제 갈 곳이 있다
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
