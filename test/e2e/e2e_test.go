@@ -1073,6 +1073,42 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
+	It("컨트롤러 자신이 있는 노드를 drain해도 스스로 이주하고 수렴한다", func() {
+		managerPods := func() []string {
+			out := mustKubectl("get", "pods", "-n", namespace, "-l", "control-plane=controller-manager",
+				"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`)
+			return nonEmptyLines(out)
+		}
+		pods := managerPods()
+		Expect(pods).To(HaveLen(1))
+		src := strings.TrimSpace(mustKubectl("get", "pod", "-n", namespace, pods[0],
+			"-o", "jsonpath={.spec.nodeName}"))
+		Expect(src).To(ContainSubstring("worker"))
+		DeferCleanup(func() { cleanupDrainNode(src) })
+
+		mustKubectl("label", "node", src, "soft-drain.io/drain=true")
+
+		// Complete는 옛 컨트롤러 Pod 오브젝트가 사라진 뒤에만 붙을 수 있고,
+		// 그 시점에 옛 인스턴스는 이미 죽어 있다 — 이주한 새 인스턴스가
+		// 리더 리스를 이어받아 루프를 계속한다는 증명이다.
+		Eventually(func() string { return nodeStateLabel(src) },
+			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
+
+		Eventually(func(g Gomega) {
+			pods := managerPods()
+			g.Expect(pods).To(HaveLen(1))
+			node := strings.TrimSpace(mustKubectl("get", "pod", "-n", namespace, pods[0],
+				"-o", "jsonpath={.spec.nodeName}"))
+			g.Expect(node).NotTo(Equal(src))
+			repl, _ := kubectl("get", "pods", "-n", namespace, "-l", "soft-drain.io/replaces",
+				"-o", "jsonpath={.items[*].metadata.name}")
+			g.Expect(strings.TrimSpace(repl)).To(BeEmpty())
+			g.Expect(strings.TrimSpace(mustKubectl("get", "deploy", "-n", namespace,
+				strings.TrimPrefix(controllerDeploy, "deploy/"),
+				"-o", "jsonpath={.status.availableReplicas}"))).To(Equal("1"))
+		}, 2*time.Minute, 3*time.Second).Should(Succeed())
+	})
+
 	It("사용자가 대체 Pod을 지우면 다음 라운드가 다시 만든다", func() {
 		const app = "sd-meddle"
 		worker := pickWorker()
