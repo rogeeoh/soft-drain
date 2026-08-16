@@ -496,7 +496,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Pods:\n%s\n", pods)
 	})
 
-	It("moves the workload to another node and attaches Complete", func() {
+	It("moves the workload to another node and attaches Complete", Label("shard-a"), func() {
 		const app = "sd-happy"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -529,7 +529,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("moving several Deployments at once never drops availability below spec", func() {
+	It("moving several Deployments at once never drops availability below spec", Label("shard-a"), func() {
 		apps := map[string]int{
 			"sd-multi-1": 1, "sd-multi-2": 1, "sd-multi-3": 1, "sd-multi-4": 1, "sd-multi-5": 1,
 			"sd-multi-ha": 2,
@@ -568,7 +568,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}
 	})
 
-	It("waits in Pending with nowhere to go, restores when the label is removed", func() {
+	It("waits in Pending with nowhere to go, restores when the label is removed", Label("shard-a"), func() {
 		const app = "sd-pending"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -592,7 +592,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podsOf(app)).To(Equal([]string{origPod}))
 	})
 
-	It("uncordon cancels and leaves Cancelled", func() {
+	It("uncordon cancels and leaves Cancelled", Label("shard-a"), func() {
 		const app = "sd-cancel"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -616,7 +616,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podsOf(app)).To(Equal([]string{origPod}))
 	})
 
-	It("converges on the new template when a rolling update lands mid-drain", func() {
+	It("converges on the new template when a rolling update lands mid-drain", Label("shard-b"), func() {
 		const app = "sd-rolling"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -645,7 +645,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("the replacement follows when a rollout prunes its target", func() {
+	It("the replacement follows when a rollout prunes its target", Label("shard-b"), func() {
 		const app = "sd-prune"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -664,7 +664,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("a template change mid-drain retires the stale replacement and the rollout moves the Pod", func() {
+	It("a template change mid-drain retires the stale replacement and the rollout moves the Pod", Label("shard-a"), func() {
 		const app = "sd-supersede"
 		applyYAML(deployYAML(workload{name: app, readyDelay: 45}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -707,7 +707,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 4*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("a pending replacement retires the moment its landing node starts draining", func() {
+	It("a pending replacement retires the moment its landing node starts draining", Label("shard-b"), func() {
 		const app = "sd-landing"
 		applyYAML(deployYAML(workload{name: app, readyDelay: 45}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -788,7 +788,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 4*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("the replacement follows when the Deployment is deleted mid-drain", func() {
+	It("the replacement follows when the Deployment is deleted mid-drain", Label("shard-a"), func() {
 		const app = "sd-delete"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -803,7 +803,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("scale-up mid-drain still means one replacement per target", func() {
+	It("scale-up mid-drain still means one replacement per target", Label("shard-b"), func() {
 		const app = "sd-scaleup"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -819,7 +819,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
 	})
 
-	It("scale to zero mid-drain removes replacements and completes", func() {
+	It("scale to zero mid-drain removes replacements and completes", Label("shard-b"), func() {
 		const app = "sd-scalezero"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -834,7 +834,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("draining every worker deadlocks, restoring one unblocks", func() {
+	It("draining every worker deadlocks, restoring one unblocks", Label("shard-a"), func() {
 		const app = "sd-alldrain"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -897,7 +897,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("a node a human cordoned first keeps human cordon ownership at the end", func() {
+	It("a node a human cordoned first keeps human cordon ownership at the end", Label("shard-a"), func() {
 		const app = "sd-precordon"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -923,7 +923,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(nodeUnschedulable(src)).To(Equal("true"))
 	})
 
-	It("Pods not owned by a Deployment are untouched", func() {
+	It("Pods not owned by a Deployment are untouched", Label("shard-d"), func() {
 		const naked = "sd-naked"
 		worker := pickWorker()
 		DeferCleanup(func() {
@@ -945,7 +945,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podCost(naked)).To(BeEmpty())
 	})
 
-	It("two drains in a row each move and finish", func() {
+	It("two drains in a row each move and finish", Label("shard-c"), func() {
 		const app = "sd-redrain"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -986,7 +986,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("a workload tolerating unschedulable loops on landed replacements", func() {
+	It("a workload tolerating unschedulable loops on landed replacements", Label("shard-d"), func() {
 		const app = "sd-tolerate"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1016,7 +1016,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 	// ─── 다중 replicas ───
 
-	It("r=3 packed on one node moves all three without downtime", func() {
+	It("r=3 packed on one node moves all three without downtime", Label("shard-d"), func() {
 		const app = "sd-pack"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1041,7 +1041,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("with r=3 spread out only the draining node's Pod moves, the rest keep their names", func() {
+	It("with r=3 spread out only the draining node's Pod moves, the rest keep their names", Label("shard-d"), func() {
 		const app = "sd-spread"
 		applyYAML(deployYAML(workload{name: app, replicas: 3, antiAffinity: true}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1071,7 +1071,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}
 	})
 
-	It("draining both nodes of an r=2 Deployment at once stays zero-downtime", func() {
+	It("draining both nodes of an r=2 Deployment at once stays zero-downtime", Label("shard-d"), func() {
 		const app = "sd-straddle"
 		applyYAML(deployYAML(workload{name: app, replicas: 2, antiAffinity: true}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1107,7 +1107,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("saturated antiAffinity leaves no seat and blocks in Pending", func() {
+	It("saturated antiAffinity leaves no seat and blocks in Pending", Label("shard-b"), func() {
 		const app = "sd-full"
 		workers := allWorkers()
 		applyYAML(deployYAML(workload{name: app, replicas: len(workers), antiAffinity: true}))
@@ -1137,7 +1137,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 	// ─── 방해 행위자 ───
 
-	It("a controller restart mid-drain resumes without duplicates", func() {
+	It("a controller restart mid-drain resumes without duplicates", Label("shard-c"), func() {
 		const app = "sd-restart"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1162,7 +1162,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("labels applied while the controller is down are handled once it returns", func() {
+	It("labels applied while the controller is down are handled once it returns", Label("shard-c"), func() {
 		const app = "sd-offline"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1197,7 +1197,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("draining the controller's own node migrates itself and converges", func() {
+	It("draining the controller's own node migrates itself and converges", Label("shard-c"), func() {
 		managerPods := func() []string {
 			out := mustKubectl("get", "pods", "-n", namespace, "-l", "control-plane=controller-manager",
 				"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`)
@@ -1233,7 +1233,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("a hand-deleted replacement is recreated next round", func() {
+	It("a hand-deleted replacement is recreated next round", Label("shard-a"), func() {
 		const app = "sd-meddle"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1251,7 +1251,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
 	})
 
-	It("a hand-removed cost annotation is stamped again", func() {
+	It("a hand-removed cost annotation is stamped again", Label("shard-b"), func() {
 		const app = "sd-cost"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -1266,7 +1266,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			60*time.Second, 3*time.Second).Should(Equal("-2147483648"))
 	})
 
-	It("a paused Deployment never receives a handover even with a Ready replacement", func() {
+	It("a paused Deployment never receives a handover even with a Ready replacement", Label("shard-b"), func() {
 		const app = "sd-paused"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1311,7 +1311,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("label flapping converges on the last declaration", func() {
+	It("label flapping converges on the last declaration", Label("shard-a"), func() {
 		const app = "sd-flap"
 		applyYAML(deployYAML(workload{name: app}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1340,7 +1340,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 	// ─── 워크로드 다양성 ───
 
-	It("a forever-unready replacement never costs the original its life", func() {
+	It("a forever-unready replacement never costs the original its life", Label("shard-d"), func() {
 		const app = "sd-noready"
 		worker := pickWorker()
 		DeferCleanup(func() {
@@ -1374,7 +1374,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			"availability dropped while replacement never became ready:\n%s", strings.Join(violations, "\n"))
 	})
 
-	It("a slow-starting workload is moved without downtime after waiting for Ready", func() {
+	It("a slow-starting workload is moved without downtime after waiting for Ready", Label("shard-d"), func() {
 		const app = "sd-slow"
 		applyYAML(deployYAML(workload{name: app, readyDelay: 20}))
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -1391,7 +1391,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			"availability dropped during slow-start drain:\n%s", strings.Join(violations, "\n"))
 	})
 
-	It("a local-PVC workload stalls as documented instead of breaking", func() {
+	It("a local-PVC workload stalls as documented instead of breaking", Label("shard-d"), func() {
 		const app = "sd-pvc"
 		applyYAML(pvcYAML("sd-data"))
 		applyYAML(deployYAML(workload{name: app, pvc: "sd-data"}))
@@ -1424,7 +1424,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("StatefulSets, Jobs and naked Pods are untouched and Complete still lands", func() {
+	It("StatefulSets, Jobs and naked Pods are untouched and Complete still lands", Label("shard-d"), func() {
 		worker := pickWorker()
 		DeferCleanup(func() {
 			_, _ = kubectl("delete", "statefulset", "-n", "default", "sd-sts", "--ignore-not-found", "--wait=false")
@@ -1461,7 +1461,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(podCost(jobPods[0])).To(BeEmpty())
 	})
 
-	It("a PDB cannot block it since eviction is never used, still zero-downtime", func() {
+	It("a PDB cannot block it since eviction is never used, still zero-downtime", Label("shard-d"), func() {
 		const app = "sd-pdb"
 		applyYAML(deployYAML(workload{name: app, replicas: 2, antiAffinity: true}))
 		applyYAML(pdbYAML("sd-pdb", app))
@@ -1493,7 +1493,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("the kubectl plugin path equals the raw label path, start to release", func() {
+	It("the kubectl plugin path equals the raw label path, start to release", Label("shard-c"), func() {
 		const app = "sd-plugin"
 		plugin := filepath.Join(GinkgoT().TempDir(), "kubectl-soft_drain")
 		out, err := utils.Run(exec.Command("go", "build", "-o", plugin,
@@ -1601,7 +1601,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("uncordon after Complete folds involvement and reopens the node for landings", func() {
+	It("uncordon after Complete folds involvement and reopens the node for landings", Label("shard-c"), func() {
 		const app = "sd-reopen"
 		workers := allWorkers()
 		Expect(len(workers)).To(BeNumerically(">=", 3))

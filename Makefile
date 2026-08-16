@@ -81,10 +81,16 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 			$(KIND) create cluster --name $(KIND_CLUSTER) --config test/e2e/kind-config.yaml ;; \
 	esac
 
+# E2E_FILTER limits the run to specs with a matching ginkgo label (e.g. shard-a).
+# E2E_KEEP leaves the Kind cluster up for the next run.
+E2E_FILTER ?=
+E2E_KEEP ?=
+
 .PHONY: test-e2e
 test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e -timeout=45m ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e -timeout=45m ./test/e2e/ -v -ginkgo.v \
+		$(if $(E2E_FILTER),-ginkgo.label-filter='$(E2E_FILTER)')
+	$(if $(E2E_KEEP),,$(MAKE) cleanup-test-e2e)
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests

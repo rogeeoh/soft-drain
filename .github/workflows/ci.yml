@@ -46,8 +46,12 @@ jobs:
           make test
 
   test-e2e:
-    name: E2E
+    name: E2E ${{ matrix.shard }}
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [shard-a, shard-b, shard-c, shard-d]
     steps:
       - name: Clone the code
         uses: actions/checkout@v4
@@ -67,7 +71,9 @@ jobs:
       - name: Verify kind installation
         run: kind version
 
+      # Each shard gets its own Kind cluster on its own runner, so the specs
+      # keep the isolation they assume while running in parallel.
       - name: Running Test e2e
         run: |
           go mod tidy
-          make test-e2e
+          make test-e2e E2E_FILTER=${{ matrix.shard }}
