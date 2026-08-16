@@ -80,3 +80,19 @@ jobs:
           gh release upload "${{ inputs.tag }}" dist/install.yaml --clobber
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Attach plugin binaries to the release
+        run: |
+          mkdir -p dist/plugin
+          cp hack/kubectl_complete-soft_drain LICENSE dist/plugin/
+          for os in linux darwin; do
+            for arch in amd64 arm64; do
+              CGO_ENABLED=0 GOOS=$os GOARCH=$arch \
+                go build -ldflags="-s -w" -o dist/plugin/kubectl-soft_drain ./cmd/kubectl-soft_drain
+              tar czf "kubectl-soft_drain_${{ steps.version.outputs.version }}_${os}_${arch}.tar.gz" \
+                -C dist/plugin kubectl-soft_drain kubectl_complete-soft_drain LICENSE
+            done
+          done
+          gh release upload "${{ inputs.tag }}" kubectl-soft_drain_*.tar.gz --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
