@@ -4,10 +4,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/signal"
+	"sort"
+	"text/tabwriter"
 	"time"
 
 	"github.com/spf13/pflag"
@@ -17,6 +20,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/yaml"
 
 	sd "github.com/rogeeoh/soft-drain/internal/controller"
 )
@@ -32,24 +36,53 @@ func main() {
 
 func run() error {
 	flags := pflag.NewFlagSet("kubectl-soft_drain", pflag.ExitOnError)
-	cancelDrain := flags.Bool("cancel", false, "remove the drain label and wait for the node to be restored")
-	waitDone := flags.Bool("wait", true, "wait until the drain completes")
+	waitDone := flags.Bool("wait", true, "wait until the operation completes")
 	timeout := flags.Duration("timeout", 0,
-		"give up waiting after this duration (0 = wait forever; the drain itself keeps running)")
+		"give up waiting after this duration (0 = wait forever; the operation itself keeps running)")
+	output := flags.StringP("output", "o", "", "status output format: json or yaml")
+	// nil인 필드는 플래그로 등록되지 않는다. 연결 선택(--kubeconfig, --context)만
+	// 남긴다 — 이 플러그인에 네임스페이스나 고급 연결 플래그는 의미가 없다.
 	cfg := genericclioptions.NewConfigFlags(true)
+	cfg.CacheDir = nil
+	cfg.ClusterName = nil
+	cfg.AuthInfoName = nil
+	cfg.Namespace = nil
+	cfg.APIServer = nil
+	cfg.TLSServerName = nil
+	cfg.Insecure = nil
+	cfg.CertFile = nil
+	cfg.KeyFile = nil
+	cfg.CAFile = nil
+	cfg.BearerToken = nil
+	cfg.Impersonate = nil
+	cfg.ImpersonateUID = nil
+	cfg.ImpersonateGroup = nil
+	cfg.ImpersonateUserExtra = nil
+	cfg.Timeout = nil
+	cfg.DisableCompression = nil
 	cfg.AddFlags(flags)
 	flags.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: kubectl soft-drain NODE [--cancel] [--wait=false] [--timeout=30m]\n\n")
+		fmt.Fprint(os.Stderr, `Usage:
+  kubectl soft-drain NODE              start a soft drain and watch until Complete
+  kubectl soft-drain status [NODE]     show nodes under soft-drain (-o json|yaml)
+  kubectl soft-drain release NODE      remove the drain label and wait for restore
+
+"status" and "release" are reserved words. kubectl uncordon also cancels an
+in-flight drain but leaves the label and a Cancelled latch; release removes
+the label and restores the node fully.
+
+`)
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(os.Args[1:]); err != nil {
 		return err
 	}
-	if len(flags.Args()) != 1 {
+	args := flags.Args()
+
+	if len(args) == 0 {
 		flags.Usage()
-		return errors.New("exactly one node name is required")
+		return nil
 	}
-	node := flags.Args()[0]
 
 	restCfg, err := cfg.ToRESTConfig()
 	if err != nil {
@@ -68,10 +101,162 @@ func run() error {
 		defer cancel()
 	}
 
-	if *cancelDrain {
-		return runCancel(ctx, cs, node, *waitDone)
+	switch {
+	case args[0] == "status":
+		if len(args) > 2 {
+			flags.Usage()
+			return errors.New("status takes at most one node name")
+		}
+		node := ""
+		if len(args) == 2 {
+			node = args[1]
+		}
+		return runStatus(ctx, cs, node, *output)
+	case args[0] == "release":
+		if len(args) != 2 {
+			flags.Usage()
+			return errors.New("release takes exactly one node name")
+		}
+		return runRelease(ctx, cs, args[1], *waitDone)
+	case len(args) == 1:
+		if *output != "" {
+			return errors.New("-o is only valid with status")
+		}
+		return runDrain(ctx, cs, args[0], *waitDone)
+	default:
+		flags.Usage()
+		return errors.New("exactly one node name is required")
 	}
-	return runDrain(ctx, cs, node, *waitDone)
+}
+
+type podRef struct {
+	Namespace string `json:"namespace"`
+	Name      string `json:"name"`
+}
+
+type replacementStatus struct {
+	Namespace        string `json:"namespace"`
+	Name             string `json:"name"`
+	Ready            bool   `json:"ready"`
+	Node             string `json:"node,omitempty"`
+	SchedulerMessage string `json:"schedulerMessage,omitempty"`
+}
+
+type nodeStatus struct {
+	Node         string              `json:"node"`
+	State        string              `json:"state,omitempty"`
+	Drain        bool                `json:"drain"`
+	Targets      []podRef            `json:"targets"`
+	Replacements []replacementStatus `json:"replacements"`
+}
+
+// runStatus는 soft-drain이 관여 중인 노드의 현황이다. 전부 읽기다.
+// 노드명 목록만 필요한 기계는 라벨 조회가 정석이다:
+// kubectl get nodes -l soft-drain.com/state=Complete -o name
+func runStatus(ctx context.Context, cs kubernetes.Interface, filter, output string) error {
+	if output != "" && output != "json" && output != "yaml" {
+		return fmt.Errorf("unsupported output format %q (json or yaml)", output)
+	}
+	nodes, err := cs.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	var rows []nodeStatus
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		if filter != "" && n.Name != filter {
+			continue
+		}
+		if n.Labels[sd.LabelDrain] == "" && n.Labels[sd.LabelState] == "" {
+			continue
+		}
+		row, err := statusRow(ctx, cs, n)
+		if err != nil {
+			return err
+		}
+		rows = append(rows, row)
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].Node < rows[j].Node })
+
+	switch output {
+	case "json":
+		out, err := json.MarshalIndent(rows, "", "  ")
+		if err != nil {
+			return err
+		}
+		fmt.Println(string(out))
+		return nil
+	case "yaml":
+		out, err := yaml.Marshal(rows)
+		if err != nil {
+			return err
+		}
+		fmt.Print(string(out))
+		return nil
+	}
+
+	if len(rows) == 0 {
+		fmt.Println("No nodes under soft-drain.")
+		return nil
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+	_, _ = fmt.Fprintln(w, "NODE\tSTATE\tTARGETS\tREPLACEMENTS")
+	for _, row := range rows {
+		state := row.State
+		if state == "" {
+			state = "-"
+		}
+		ready, pending := 0, 0
+		for _, r := range row.Replacements {
+			if r.Ready {
+				ready++
+			} else {
+				pending++
+			}
+		}
+		repl := "-"
+		if ready+pending > 0 {
+			repl = fmt.Sprintf("%d Ready, %d Pending", ready, pending)
+		}
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%d\t%s\n", row.Node, state, len(row.Targets), repl)
+	}
+	return w.Flush()
+}
+
+func statusRow(ctx context.Context, cs kubernetes.Interface, n *corev1.Node) (nodeStatus, error) {
+	row := nodeStatus{
+		Node:         n.Name,
+		State:        n.Labels[sd.LabelState],
+		Drain:        n.Labels[sd.LabelDrain] == "true",
+		Targets:      []podRef{},
+		Replacements: []replacementStatus{},
+	}
+	targets, err := markedPods(ctx, cs, n.Name)
+	if err != nil {
+		return row, err
+	}
+	uids := map[types.UID]string{}
+	for _, p := range targets {
+		uids[p.UID] = p.Namespace + "/" + p.Name
+		row.Targets = append(row.Targets, podRef{Namespace: p.Namespace, Name: p.Name})
+	}
+	for _, p := range replacementsFor(ctx, cs, uids) {
+		r := replacementStatus{
+			Namespace: p.Namespace,
+			Name:      p.Name,
+			Ready:     podIsReady(&p),
+			Node:      p.Spec.NodeName,
+		}
+		if !r.Ready {
+			for _, c := range p.Status.Conditions {
+				if c.Type == corev1.PodScheduled && c.Status != corev1.ConditionTrue {
+					r.SchedulerMessage = c.Message
+				}
+			}
+		}
+		row.Replacements = append(row.Replacements, r)
+	}
+	return row, nil
 }
 
 func runDrain(ctx context.Context, cs kubernetes.Interface, node string, waitDone bool) error {
@@ -108,7 +293,7 @@ func runDrain(ctx context.Context, cs kubernetes.Interface, node string, waitDon
 	fmt.Printf("node/%s labeled for soft-drain\n", node)
 
 	if !waitDone {
-		fmt.Printf("not waiting; check with: kubectl get node %s -L soft-drain.com/state\n", node)
+		fmt.Printf("not waiting; check with: kubectl soft-drain status\n")
 		return nil
 	}
 	return watchDrain(ctx, cs, node)
@@ -199,7 +384,9 @@ func diagnose(cs kubernetes.Interface, node string, seenTargets map[types.UID]st
 	}
 }
 
-func runCancel(ctx context.Context, cs kubernetes.Interface, node string, waitDone bool) error {
+// runRelease는 라벨을 걷는다. 진행 중이면 취소가 되고, Complete면 관리 종료가
+// 된다 — 실체는 같은 동작이다.
+func runRelease(ctx context.Context, cs kubernetes.Interface, node string, waitDone bool) error {
 	n, err := cs.CoreV1().Nodes().Get(ctx, node, metav1.GetOptions{})
 	if apierrors.IsNotFound(err) {
 		return fmt.Errorf("node %q not found", node)
@@ -208,7 +395,7 @@ func runCancel(ctx context.Context, cs kubernetes.Interface, node string, waitDo
 		return err
 	}
 	if n.Labels[sd.LabelDrain] == "" && n.Labels[sd.LabelState] == "" {
-		fmt.Printf("node/%s has no soft-drain to cancel\n", node)
+		fmt.Printf("node/%s is not under soft-drain\n", node)
 		return nil
 	}
 	if err := setDrainLabel(ctx, cs, node, false); err != nil {

@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -52,7 +53,16 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
-	// 실 클러스터 보호: 현재 컨텍스트가 전용 kind 클러스터일 때만 진행한다 (CLAUDE.md)
+	// 실 클러스터 보호 1: 스위트 전용 kubeconfig를 만들어 프로세스 전체에 고정한다.
+	// 사용자 kubeconfig의 current-context에 의존하면, 실행 도중 다른 셸에서
+	// 컨텍스트를 바꿨을 때 deploy/undeploy가 그 클러스터로 나간다.
+	kubeconfig := filepath.Join(GinkgoT().TempDir(), "kubeconfig")
+	_, err := utils.Run(exec.Command("kind", "export", "kubeconfig",
+		"--name", kindClusterName(), "--kubeconfig", kubeconfig))
+	Expect(err).NotTo(HaveOccurred(), "Failed to export the kind cluster kubeconfig")
+	os.Setenv("KUBECONFIG", kubeconfig)
+
+	// 실 클러스터 보호 2: 고정한 kubeconfig가 정말 전용 kind 클러스터를 가리키는지 확인
 	out, err := utils.Run(exec.Command("kubectl", "config", "current-context"))
 	Expect(err).NotTo(HaveOccurred(), "Failed to read current kubectl context")
 	Expect(strings.TrimSpace(out)).To(Equal("kind-"+kindClusterName()),

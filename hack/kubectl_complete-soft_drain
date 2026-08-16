@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# Shell completion for the kubectl soft-drain plugin (kubectl >= 1.26).
+# kubectl invokes this with the command-line words; the last one is the word
+# being completed. Print one candidate per line; ":4" means no file completion.
+set -euo pipefail
+
+args=("$@")
+cur="${args[${#args[@]}-1]}"
+
+# Pass --context/--kubeconfig through so node names come from the right cluster.
+# Remember whether a subcommand word is already present.
+passthrough=()
+subcommand=""
+for ((i = 1; i < ${#args[@]} - 1; i++)); do
+  case "${args[$i]}" in
+    --context|--kubeconfig)
+      passthrough+=("${args[$i]}" "${args[$((i + 1))]}")
+      ;;
+    --context=*|--kubeconfig=*)
+      passthrough+=("${args[$i]}")
+      ;;
+    status|release)
+      subcommand="${args[$i]}"
+      ;;
+  esac
+done
+
+nodes() {
+  # ${arr[@]+...} keeps macOS bash 3.2 happy when the array is empty under set -u.
+  kubectl get nodes -o name "$@" ${passthrough[@]+"${passthrough[@]}"} 2>/dev/null | sed 's|^node/||'
+}
+
+if [[ "$cur" == -* ]]; then
+  printf '%s\n' --wait=false --timeout -o --context --kubeconfig
+elif [[ -n "$subcommand" ]]; then
+  # status/release 뒤에는 soft-drain이 관여 중인 노드만 후보다.
+  nodes -l soft-drain.com/drain
+else
+  printf '%s\n' status release
+  nodes
+fi
+echo ":4"

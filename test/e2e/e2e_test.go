@@ -1369,7 +1369,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
-	It("kubectl 플러그인으로 걸고 취소해도 라벨 경로와 같다", func() {
+	It("kubectl 플러그인으로 걸고 해제해도 라벨 경로와 같다", func() {
 		const app = "sd-plugin"
 		plugin := filepath.Join(GinkgoT().TempDir(), "kubectl-soft_drain")
 		out, err := utils.Run(exec.Command("go", "build", "-o", plugin,
@@ -1389,13 +1389,26 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(replacementPods(app)).To(HaveLen(1))
 		}, 60*time.Second, 2*time.Second).Should(Succeed())
 
-		By("cancelling with --cancel")
-		out, err = utils.Run(exec.Command(plugin, worker, "--cancel", "--timeout", "2m"))
+		By("checking status output, human and machine")
+		out, err = utils.Run(exec.Command(plugin, "status"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).To(ContainSubstring(worker))
+		Expect(out).To(ContainSubstring("InProgress"))
+		out, err = utils.Run(exec.Command(plugin, "status", worker, "-o", "json"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).To(ContainSubstring(`"state": "InProgress"`))
+		Expect(out).To(ContainSubstring(`"ready": false`))
+
+		By("releasing")
+		out, err = utils.Run(exec.Command(plugin, "release", worker, "--timeout", "2m"))
 		Expect(err).NotTo(HaveOccurred(), out)
 		Expect(nodeStateLabel(worker)).To(BeEmpty())
 		Expect(nodeUnschedulable(worker)).To(BeEmpty())
 		Eventually(func() []string { return replacementPods(app) },
 			60*time.Second, 2*time.Second).Should(BeEmpty())
+		out, err = utils.Run(exec.Command(plugin, "status"))
+		Expect(err).NotTo(HaveOccurred(), out)
+		Expect(out).NotTo(ContainSubstring(worker))
 
 		By("draining to completion in blocking mode")
 		applyYAML(deployYAML(workload{name: app})) // 고정 해제 — 이제 갈 곳이 있다
