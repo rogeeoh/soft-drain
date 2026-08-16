@@ -27,6 +27,9 @@ import (
 
 const pollInterval = 2 * time.Second
 
+// version은 빌드 시 -ldflags "-X main.version=..."로 주입된다.
+var version = "dev"
+
 func main() {
 	err := run()
 	if err == nil {
@@ -75,8 +78,9 @@ func run() error {
   kubectl soft-drain NODE...           start soft drains and watch until Complete
   kubectl soft-drain status [NODE...]  show nodes under soft-drain (-o json|yaml)
   kubectl soft-drain release NODE...   remove drain labels and wait for restore
+  kubectl soft-drain version           print the plugin version
 
-"status" and "release" are reserved words. kubectl uncordon also cancels an
+"status", "release" and "version" are reserved words. kubectl uncordon also cancels an
 in-flight drain but leaves the label and a Cancelled latch; release removes
 the label and restores the node fully.
 
@@ -90,6 +94,11 @@ the label and restores the node fully.
 
 	if len(args) == 0 {
 		flags.Usage()
+		return nil
+	}
+	// version은 클러스터 없이도 답해야 한다 — 클라이언트 생성보다 먼저 본다.
+	if args[0] == "version" {
+		fmt.Printf("kubectl-soft_drain %s\n", version)
 		return nil
 	}
 

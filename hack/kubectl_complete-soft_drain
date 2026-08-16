@@ -48,12 +48,14 @@ nodes() {
 
 if [[ "$cur" == -* ]]; then
   printf '%s\n' --wait=false --timeout -o --context --kubeconfig
+elif [[ "$subcommand" == "version" ]]; then
+  : # version은 인자를 받지 않는다
 elif [[ -n "$subcommand" ]]; then
   # status/release 뒤에는 soft-drain이 관여 중인 노드만 후보다.
   nodes -l soft-drain.com/drain
 else
   if [[ ${#chosen[@]} -eq 0 ]]; then
-    printf '%s\n' status release
+    printf '%s\n' status release version
   fi
   nodes
 fi

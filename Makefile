@@ -108,9 +108,11 @@ lint-config: golangci-lint ## Verify golangci-lint linter configuration
 build: manifests generate fmt vet ## Build manager binary.
 	go build -o bin/manager cmd/main.go
 
+PLUGIN_VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+
 .PHONY: plugin
 plugin: fmt vet ## Build the kubectl-soft_drain plugin binary.
-	go build -o bin/kubectl-soft_drain ./cmd/kubectl-soft_drain
+	go build -ldflags "-X main.version=$(PLUGIN_VERSION)" -o bin/kubectl-soft_drain ./cmd/kubectl-soft_drain
 
 .PHONY: run
 run: manifests generate fmt vet ## Run a controller from your host.
