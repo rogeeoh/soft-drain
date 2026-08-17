@@ -54,7 +54,9 @@ kubectl uncordon node-01                                  # also cancels
 
 The controller cordons the node, moves every Deployment-owned Pod as described above,
 then labels the node `soft-drain.com/state=Complete`. The node stays cordoned —
-rebooting or deleting it afterwards is your call, not soft-drain's.
+rebooting or deleting it afterwards is your call, not soft-drain's. When you remove
+the drain label after maintenance, the controller also lifts the cordon it applied;
+a cordon you set yourself is left alone.
 
 | Node state label | Meaning |
 |---|---|

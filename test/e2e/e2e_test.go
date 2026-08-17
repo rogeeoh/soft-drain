@@ -874,8 +874,8 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(podPhase(repls[0])).To(Equal("Pending"))
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 
-		// Complete된 빈 워커 하나를 사람이 되돌린다. Complete는 cordon 소유권을
-		// 사람에게 넘겼으므로 라벨 제거만으로는 uncordon되지 않는다.
+		// Complete된 빈 워커 하나를 되돌린다. 라벨만 걷으면 컨트롤러가
+		// 자기가 걸었던 cordon도 함께 걷는다 — 여기서 그 동작이 교착을 푼다.
 		var freed string
 		for _, w := range workers {
 			if w != src {
@@ -885,7 +885,6 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}
 		By("freeing one completed worker")
 		mustKubectl("label", "node", freed, "soft-drain.com/drain-")
-		mustKubectl("uncordon", freed)
 
 		By("waiting for the stuck drain to complete")
 		Eventually(func(g Gomega) {
@@ -1574,8 +1573,9 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), out)
 		for _, o := range two {
 			Expect(nodeStateLabel(o)).To(BeEmpty())
-			// Complete에서 걷으면 cordon은 남는다 — 소유권이 이미 사람에게 넘어왔다
-			Expect(nodeUnschedulable(o)).To(Equal("true"))
+			// release는 우리가 걸었던 cordon도 걷는다 — 복원 patch가 원자적이라
+			// state가 비었으면 uncordon도 끝나 있다
+			Expect(nodeUnschedulable(o)).To(BeEmpty())
 		}
 
 		By("draining to completion in blocking mode")

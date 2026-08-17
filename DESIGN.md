@@ -32,7 +32,7 @@ kubectl label node node-01 soft-drain.com/drain-          # 취소
 kubectl uncordon node-01                                 # 이것도 취소다 (state=Cancelled 로 남는다)
 ```
 
-끝난 노드는 cordon된 채로 남는다. 그 다음에 drain을 하든 노드를 리부팅하든 soft-drain이 상관할 일이 아니다.
+끝난 노드는 cordon된 채로 남는다. 그 다음에 drain을 하든 노드를 리부팅하든 soft-drain이 상관할 일이 아니다. 정비가 끝나 drain 라벨을 걷으면 우리가 걸었던 cordon도 함께 걷힌다 — 라벨 제거가 곧 노드 반환이다. 사람이 미리 걸어둔 cordon이면 그대로 둔다.
 
 ### kubectl 플러그인
 
@@ -45,7 +45,7 @@ kubectl soft-drain status node-01 -o json  # 특정 노드, 기계용 (json|yaml
 kubectl soft-drain release node-01 [...]   # 라벨을 걷고 복원을 기다린다
 ```
 
-release는 진행 중이면 취소가 되고(uncordon 포함 복원) Complete면 관리 종료가 된다(cordon은 이양대로 사람 몫으로 남는다) — 실체는 같은 라벨 제거다. `kubectl uncordon`도 취소지만 라벨과 Cancelled 래치가 남는 점이 다르다 — release는 전부 걷는다. `--timeout`이 터지면 Pending 대체 Pod과 스케줄러 메시지를 보여주고 0이 아닌 코드로 나간다 — "막혔을 때 보는 법"의 자동화다. 중간에 끊어도 라벨은 남으므로 drain은 계속된다. `state=Cancelled`인 노드에 다시 drain을 걸면 라벨을 걷어 복원시킨 뒤 다시 붙인다.
+release는 진행 중이면 취소가 되고 Complete면 관리 종료가 된다 — 실체는 같은 라벨 제거고, 결말도 같다: 우리가 남긴 것을 전부 걷는다(우리가 걸었던 cordon 포함). 그래서 release는 정비가 끝난 뒤의 동사다 — 리부팅 전에 하면 비워 둔 노드가 도로 열린다. `kubectl uncordon`도 취소지만 라벨과 Cancelled 래치가 남는 점이 다르다 — release는 전부 걷는다. `--timeout`이 터지면 Pending 대체 Pod과 스케줄러 메시지를 보여주고 0이 아닌 코드로 나간다 — "막혔을 때 보는 법"의 자동화다. 중간에 끊어도 라벨은 남으므로 drain은 계속된다. `state=Cancelled`인 노드에 다시 drain을 걸면 라벨을 걷어 복원시킨 뒤 다시 붙인다.
 
 현황판에 "언제부터"는 없다 — 컨트롤러가 무기억이라 시작 시각을 어디에도 기록하지 않는다. `-o`의 몫은 플러그인만 계산할 수 있는 집계(타깃·대체 Pod 상태·스케줄러 메시지)다. 노드명 목록이 필요한 기계는 라벨 조회가 정석이다: `kubectl get nodes -l soft-drain.com/state=Complete -o name`.
 
@@ -74,7 +74,7 @@ release는 진행 중이면 취소가 되고(uncordon 포함 복원) Complete면
 
 `drain` 라벨이 사라지면 되돌린다 — 우리 값이 박힌 `pod-deletion-cost`를 걷고, `cordoned-by-controller`가 있으면 uncordon하고, `state` 라벨을 지운다.
 
-**누가 uncordon하면 관여를 접는다 — 진행 중이든 끝난 뒤든.** `state`가 `InProgress`나 `Complete`인데 노드가 `unschedulable`이 아니면 그렇게 된 것이다 — 두 상태 모두 cordon을 확인한 뒤에만 붙기 때문에 이 조합이 곧 증거다. 진행 중이라면 cordon은 종료를 보장하던 전제라서 전제가 사라진 채 계속할 수 없고, 끝난 뒤라면 cordon 소유권을 넘겨받은 사람이 노드를 다시 쓰기로 결정한 것이다. 어느 쪽이든 다시 cordon해서 사람과 싸우지 않는다. cost를 걷고 `state=Cancelled`를 붙인 뒤 손을 뗀다. 대체 Pod은 회수 경로가 걷는다. `Cancelled`는 래치다 — 라벨을 걷으면 지워지고, 다시 하려면 라벨을 걷었다가 다시 붙인다.
+**누가 uncordon하면 관여를 접는다 — 진행 중이든 끝난 뒤든.** `state`가 `InProgress`나 `Complete`인데 노드가 `unschedulable`이 아니면 그렇게 된 것이다 — 두 상태 모두 cordon을 확인한 뒤에만 붙기 때문에 이 조합이 곧 증거다. 진행 중이라면 cordon은 종료를 보장하던 전제라서 전제가 사라진 채 계속할 수 없고, 끝난 뒤라면 사람이 우리 cordon을 풀고 노드를 다시 쓰기로 결정한 것이다. 어느 쪽이든 다시 cordon해서 사람과 싸우지 않는다. cost를 걷고 `cordoned-by-controller`를 지우고 `state=Cancelled`를 붙인 뒤 손을 뗀다. 어노테이션을 지우는 이유: 기록된 cordon은 사람 손에 이미 풀렸으므로, 이후 사람이 새로 건 cordon을 라벨 제거 시점의 복원이 우리 것으로 오인해 풀면 안 된다. 대체 Pod은 회수 경로가 걷는다. `Cancelled`는 래치다 — 라벨을 걷으면 지워지고, 다시 하려면 라벨을 걷었다가 다시 붙인다.
 
 `Complete`를 접지 않고 두면 그 노드가 삭제 자석이 된다. 방금 비워져 가장 한가한 노드가 열렸으니 스케줄러는 다른 drain의 대체 Pod을 정확히 거기 앉히고, 착지 검사는 앉는 족족 지운다. 클러스터가 작을수록 모든 drain이 그 노드로 빨려 들어간다.
 
@@ -162,9 +162,9 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 
 ### 5. 완료
 
-노드 위에 타깃이 하나도 없으면 `cordoned-by-controller` 어노테이션을 지우고 `state=Complete`를 붙인 뒤 Event를 낸다. 어노테이션을 지우는 것은 cordon의 소유권을 사람에게 넘긴다는 뜻이다. `Complete`는 래치다 — cordon이 유지되는 동안에는 drain 라벨이 걷힐 때까지 관여하지 않는다. cordon된 노드에 새로 앉을 수 있는 건 `unschedulable`을 tolerate하는 Pod뿐인데, 그건 어차피 옮기지 못하는 부류다. 이게 없으면 완료를 확인하고 라벨을 정리한 사용자가 노드를 다시 열게 되고, 비워 둔 노드에 Pod이 몰린 채로 리부팅하게 된다.
+노드 위에 타깃이 하나도 없으면 `state=Complete`를 붙인 뒤 Event를 낸다. `cordoned-by-controller` 어노테이션은 그대로 둔다 — cordon은 여전히 우리가 건 것이고, drain 라벨이 걷힐 때 함께 걷힌다. `Complete`는 래치다 — cordon이 유지되는 동안에는 drain 라벨이 걷힐 때까지 관여하지 않는다. cordon된 노드에 새로 앉을 수 있는 건 `unschedulable`을 tolerate하는 Pod뿐인데, 그건 어차피 옮기지 못하는 부류다. 래치가 없으면 리부팅을 기다리는 노드가 도로 열려 Pod이 몰린 채로 리부팅하게 된다 — 노드를 여는 순간은 사람이 라벨을 걷을 때(반환)와 uncordon할 때(취소)뿐이어야 한다.
 
-소유권을 넘겨받은 사람이 uncordon하면 래치는 `Cancelled`로 접힌다(1번). 착지 금지도 함께 풀린다 — 리부팅하러 갈 노드라서 막았던 것인데, uncordon은 리부팅 안 간다는 선언이다. uncordon과 감지 사이의 짧은 창에서는 착지한 대체 Pod이 지워질 수 있지만, 다음 라운드가 새로 만든다.
+사람이 uncordon하면 래치는 `Cancelled`로 접힌다(1번). 착지 금지도 함께 풀린다 — 리부팅하러 갈 노드라서 막았던 것인데, uncordon은 리부팅 안 간다는 선언이다. uncordon과 감지 사이의 짧은 창에서는 착지한 대체 Pod이 지워질 수 있지만, 다음 라운드가 새로 만든다.
 
 **완료 판정에는 terminating 타깃도 센다.** `deletionTimestamp`가 찍혀도 grace period 동안 계속 돈다. 여기서 빼면 아직 작업이 돌고 있는 노드에 `Complete`가 붙고, 그걸 보고 노드를 리부팅한 사람이 그 작업을 죽인다. 만들기에서는 빼고 완료 판정에서는 세는 이유가 이것이다.
 

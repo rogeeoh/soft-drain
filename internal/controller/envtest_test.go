@@ -491,7 +491,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getPod(repl.Name).Labels).NotTo(HaveKey(LabelReplaces))
 	})
 
-	It("attaches Complete and hands cordon ownership over when no targets remain", func() {
+	It("attaches Complete and keeps the cordon annotation when no targets remain", func() {
 		rec := &fakeRecorder{}
 		r := &NodeReconciler{Client: k8sClient, Reader: k8sClient, Recorder: rec}
 		node := createNode(uniq("empty-node"), map[string]string{LabelDrain: "true"})
@@ -502,8 +502,64 @@ var _ = Describe("NodeReconciler", func() {
 		got := getNode(node.Name)
 		Expect(got.Spec.Unschedulable).To(BeTrue())
 		Expect(got.Labels[LabelState]).To(Equal(StateComplete))
-		Expect(got.Annotations).NotTo(HaveKey(AnnotationCordoned))
+		// cordon은 여전히 우리 것 — 어노테이션은 라벨이 걷힐 때 함께 걷힌다
+		Expect(got.Annotations).To(HaveKeyWithValue(AnnotationCordoned, "true"))
 		Expect(rec.has("DrainComplete")).To(BeTrue())
+	})
+
+	It("release after Complete uncordons the controller's cordon", func() {
+		rec := &fakeRecorder{}
+		r := &NodeReconciler{Client: k8sClient, Reader: k8sClient, Recorder: rec}
+		node := createNode(uniq("done-node"), map[string]string{LabelDrain: "true"})
+
+		// 빈 노드라 첫 라운드에 cordon과 Complete까지 간다
+		_, err := r.Reconcile(ctx, nodeReq(node))
+		Expect(err).NotTo(HaveOccurred())
+		got := getNode(node.Name)
+		Expect(got.Labels[LabelState]).To(Equal(StateComplete))
+		Expect(got.Annotations).To(HaveKeyWithValue(AnnotationCordoned, "true"))
+
+		delete(got.Labels, LabelDrain)
+		Expect(k8sClient.Update(ctx, got)).To(Succeed())
+
+		_, err = r.Reconcile(ctx, nodeReq(node))
+		Expect(err).NotTo(HaveOccurred())
+
+		got = getNode(node.Name)
+		Expect(got.Spec.Unschedulable).To(BeFalse())
+		Expect(got.Labels).NotTo(HaveKey(LabelState))
+		Expect(got.Annotations).NotTo(HaveKey(AnnotationCordoned))
+	})
+
+	It("release leaves a cordon the human re-applied after cancelling", func() {
+		f := setupFixture()
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// 사람이 uncordon — Cancelled로 접히며 어노테이션이 지워진다
+		node := getNode(f.node.Name)
+		node.Spec.Unschedulable = false
+		Expect(k8sClient.Update(ctx, node)).To(Succeed())
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateCancelled))
+
+		// 사람이 다른 이유로 다시 cordon한 뒤 라벨을 걷는다
+		node = getNode(f.node.Name)
+		node.Spec.Unschedulable = true
+		Expect(k8sClient.Update(ctx, node)).To(Succeed())
+		node = getNode(f.node.Name)
+		delete(node.Labels, LabelDrain)
+		Expect(k8sClient.Update(ctx, node)).To(Succeed())
+
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		got := getNode(f.node.Name)
+		// 우리 기록이 아닌 cordon은 걷지 않는다
+		Expect(got.Spec.Unschedulable).To(BeTrue())
+		Expect(got.Labels).NotTo(HaveKey(LabelState))
+		Expect(got.Annotations).NotTo(HaveKey(AnnotationCordoned))
 	})
 
 	It("Complete latches: later targets are left alone", func() {
@@ -557,7 +613,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateComplete))
 
-		// 소유권을 넘겨받은 사람이 노드를 다시 쓰기로 함
+		// 사람이 우리 cordon을 풀고 노드를 다시 쓰기로 함
 		node := getNode(f.node.Name)
 		node.Spec.Unschedulable = false
 		Expect(k8sClient.Update(ctx, node)).To(Succeed())

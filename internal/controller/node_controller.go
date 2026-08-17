@@ -118,6 +118,8 @@ func (r *NodeReconciler) sweepDeletionCost(ctx context.Context, nodeName string)
 
 // cancel은 drain 중 uncordon된 노드에서 손을 뗀다. cordon은 이 방식의 전제라
 // 전제가 사라지면 계속할 의미가 없다. 다시 cordon해서 사람과 싸우지 않는다.
+// 어노테이션도 함께 지운다 — 기록된 cordon은 사람 손에 이미 풀렸으므로, 이후
+// 사람이 새로 건 cordon을 restore가 우리 것으로 오인해 풀면 안 된다.
 func (r *NodeReconciler) cancel(ctx context.Context, node *corev1.Node) error {
 	if err := r.sweepDeletionCost(ctx, node.Name); err != nil {
 		return err
@@ -147,7 +149,7 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 
 	// InProgress와 Complete는 cordon을 확인한 뒤에만 붙는다. 그런데 unschedulable이
 	// 아니라면 누군가 uncordon한 것이다 — 진행 중이면 종료를 보장하던 전제가
-	// 사라졌고, 끝난 뒤면 cordon 소유권을 넘겨받은 사람이 노드를 다시 쓰기로 한
+	// 사라졌고, 끝난 뒤면 사람이 우리 cordon을 풀고 노드를 다시 쓰기로 한
 	// 것이다. 어느 쪽이든 관여를 접는다.
 	state := node.Labels[LabelState]
 	if (state == StateInProgress || state == StateComplete) && !node.Spec.Unschedulable {
@@ -214,15 +216,15 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
-// complete는 어노테이션을 지워 cordon 소유권을 사람에게 넘기고 Complete를 붙인다.
+// complete는 Complete를 붙인다. cordoned-by-controller 어노테이션은 그대로 둔다 —
+// cordon은 여전히 우리가 건 것이고, drain 라벨이 걷힐 때 restore가 함께 걷는다.
 func (r *NodeReconciler) complete(ctx context.Context, node *corev1.Node) error {
 	if node.Labels[LabelState] == StateComplete {
 		return nil
 	}
 	patch := mergePatch(map[string]any{
 		"metadata": map[string]any{
-			"labels":      map[string]any{LabelState: StateComplete},
-			"annotations": map[string]any{AnnotationCordoned: nil},
+			"labels": map[string]any{LabelState: StateComplete},
 		},
 	})
 	if err := r.Patch(ctx, node, patch); err != nil {
