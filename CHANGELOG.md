@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.3.0](https://github.com/rogeeoh/soft-drain/compare/v0.2.0...v0.3.0) (2026-08-17)
+
+
+### Features
+
+* lift the controller's own cordon on release ([766ff9f](https://github.com/rogeeoh/soft-drain/commit/766ff9f7e3885f585a0669e4b80126632acaeeb1))
+
 ## [0.2.0](https://github.com/rogeeoh/soft-drain/compare/v0.1.0...v0.2.0) (2026-08-16)
 
 
