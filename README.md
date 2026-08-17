@@ -72,7 +72,7 @@ and watches the rest:
 
 ```bash
 # from a release (binary + shell completion; pick your os_arch)
-curl -sL https://github.com/rogeeoh/soft-drain/releases/download/v0.2.0/kubectl-soft_drain_0.2.0_darwin_arm64.tar.gz \
+curl -sL https://github.com/rogeeoh/soft-drain/releases/download/v0.3.0/kubectl-soft_drain_0.3.0_darwin_arm64.tar.gz \
   | tar xz -C ~/bin kubectl-soft_drain kubectl_complete-soft_drain
 # or from source
 make plugin && cp bin/kubectl-soft_drain hack/kubectl_complete-soft_drain ~/bin/
