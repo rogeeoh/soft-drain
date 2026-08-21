@@ -1,0 +1,30 @@
+name: Design sync
+
+on:
+  pull_request:
+    paths:
+      - 'DESIGN.md'
+      - 'DESIGN.ko.md'
+
+jobs:
+  translation:
+    name: DESIGN.md and DESIGN.ko.md move together
+    runs-on: ubuntu-latest
+    steps:
+      - name: Clone the code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # DESIGN.md is normative and DESIGN.ko.md is its translation. Letting one
+      # move without the other is how the translation silently goes stale.
+      - name: Both files must change together
+        run: |
+          changed=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...HEAD)
+          en=$(printf '%s\n' "$changed" | grep -cx 'DESIGN.md' || true)
+          ko=$(printf '%s\n' "$changed" | grep -cx 'DESIGN.ko.md' || true)
+          if [ "$en" != "$ko" ]; then
+            echo "DESIGN.md=$en DESIGN.ko.md=$ko"
+            echo "A design change updates both files in the same PR."
+            exit 1
+          fi

@@ -35,15 +35,15 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
-// NodeReconciler는 drain 라벨이 붙은 노드를 비운다 (DESIGN.md "컨트롤러가 하는 일").
+// NodeReconciler empties nodes carrying the drain label (DESIGN.md "What the controller does").
 type NodeReconciler struct {
 	client.Client
-	// Reader는 API 서버를 직접 읽는다. 캐시는 다시 볼 때를 알려주는 데만 쓴다.
+	// Reader reads straight from the API server. The cache only tells us when to look again.
 	Reader   client.Reader
 	Recorder events.EventRecorder
 }
 
-// target은 그 노드 위에서 owner가 ReplicaSet이고 그 ReplicaSet의 owner가 Deployment인 Pod이다.
+// target is a Pod on the node whose owner is a ReplicaSet whose owner is a Deployment.
 type target struct {
 	pod *corev1.Pod
 	rs  *appsv1.ReplicaSet
@@ -66,8 +66,8 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	return r.drain(ctx, node)
 }
 
-// restore는 drain 라벨이 사라진 노드에서 우리가 남긴 것을 걷는다.
-// 대체 Pod은 PodReconciler의 판정(타깃이 drain 노드에 없으면 지운다)이 걷는다.
+// restore takes back what we left on a node whose drain label is gone.
+// Replacements are collected by PodReconciler's rule: delete unless the target is on a draining node.
 func (r *NodeReconciler) restore(ctx context.Context, node *corev1.Node) error {
 	if node.Labels[LabelState] == "" && node.Annotations[AnnotationCordoned] == "" {
 		return nil
@@ -94,7 +94,7 @@ func (r *NodeReconciler) restore(ctx context.Context, node *corev1.Node) error {
 	return nil
 }
 
-// sweepDeletionCost는 노드 위 Pod에서 우리가 박은 pod-deletion-cost를 걷는다.
+// sweepDeletionCost removes the pod-deletion-cost we wrote on the node's Pods.
 func (r *NodeReconciler) sweepDeletionCost(ctx context.Context, nodeName string) error {
 	pods := &corev1.PodList{}
 	if err := r.Reader.List(ctx, pods, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
@@ -102,7 +102,7 @@ func (r *NodeReconciler) sweepDeletionCost(ctx context.Context, nodeName string)
 	}
 	for i := range pods.Items {
 		pod := &pods.Items[i]
-		// 값이 정확히 우리 것일 때만 지운다
+		// delete it only when the value is exactly ours
 		if pod.Annotations[AnnotationPodDeletionCost] != PodDeletionCost {
 			continue
 		}
@@ -116,10 +116,10 @@ func (r *NodeReconciler) sweepDeletionCost(ctx context.Context, nodeName string)
 	return nil
 }
 
-// cancel은 drain 중 uncordon된 노드에서 손을 뗀다. cordon은 이 방식의 전제라
-// 전제가 사라지면 계속할 의미가 없다. 다시 cordon해서 사람과 싸우지 않는다.
-// 어노테이션도 함께 지운다 — 기록된 cordon은 사람 손에 이미 풀렸으므로, 이후
-// 사람이 새로 건 cordon을 restore가 우리 것으로 오인해 풀면 안 된다.
+// cancel lets go of a node uncordoned mid-drain. The cordon is the premise of this
+// approach, and without it there is no point continuing. We do not re-cordon and fight
+// the human. The annotation goes too — the cordon it recorded is already gone by their
+// hand, and a cordon they place later must not be mistaken for ours by restore.
 func (r *NodeReconciler) cancel(ctx context.Context, node *corev1.Node) error {
 	if err := r.sweepDeletionCost(ctx, node.Name); err != nil {
 		return err
@@ -142,26 +142,26 @@ func (r *NodeReconciler) cancel(ctx context.Context, node *corev1.Node) error {
 func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
 
-	// Cancelled는 래치다. drain 라벨이 걷힐 때까지 관여하지 않는다.
+	// Cancelled is a latch. Nothing happens until the drain label is removed.
 	if node.Labels[LabelState] == StateCancelled {
 		return ctrl.Result{}, nil
 	}
 
-	// InProgress와 Complete는 cordon을 확인한 뒤에만 붙는다. 그런데 unschedulable이
-	// 아니라면 누군가 uncordon한 것이다 — 진행 중이면 종료를 보장하던 전제가
-	// 사라졌고, 끝난 뒤면 사람이 우리 cordon을 풀고 노드를 다시 쓰기로 한
-	// 것이다. 어느 쪽이든 관여를 접는다.
+	// InProgress and Complete are only ever set after confirming the cordon. If the node
+	// is no longer unschedulable, someone uncordoned it — mid-drain the premise that
+	// guaranteed termination is gone, and after completion a human lifted our cordon and
+	// decided to use the node again. Either way we let go.
 	state := node.Labels[LabelState]
 	if (state == StateInProgress || state == StateComplete) && !node.Spec.Unschedulable {
 		return ctrl.Result{}, r.cancel(ctx, node)
 	}
 
-	// Complete는 래치다. cordon이 유지되는 동안 관여하지 않는다.
+	// Complete is a latch. While the cordon holds, we do not act.
 	if state == StateComplete {
 		return ctrl.Result{}, nil
 	}
 
-	// 1. 노드 마킹 — 우리가 실제로 값을 바꿨을 때만 어노테이션을 단다
+	// 1. marking the node — the annotation is written only when we actually changed the value
 	if !node.Spec.Unschedulable {
 		patch := mergePatch(map[string]any{
 			"spec":     map[string]any{"unschedulable": true},
@@ -178,7 +178,7 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 		return ctrl.Result{}, err
 	}
 
-	// 6. 완료 — terminating 타깃도 센다
+	// 6. completion — terminating targets count too
 	if len(targets) == 0 {
 		return ctrl.Result{}, r.complete(ctx, node)
 	}
@@ -205,8 +205,8 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 		return ctrl.Result{}, err
 	}
 	if retry {
-		// 판정과 삭제 사이에 세상이 바뀌었다. 낡은 명단으로 넘기기까지 가지 않고
-		// 라운드를 접는다. 다음 라운드가 새 상태에서 처음부터 판정한다.
+		// The world changed between the decision and the deletion. Rather than carry a stale
+		// list into hand-over, end the round. The next round decides again from scratch.
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 	if err := r.handOver(ctx, node, targets, replsByUID); err != nil {
@@ -216,8 +216,8 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 	return ctrl.Result{RequeueAfter: 15 * time.Second}, nil
 }
 
-// complete는 Complete를 붙인다. cordoned-by-controller 어노테이션은 그대로 둔다 —
-// cordon은 여전히 우리가 건 것이고, drain 라벨이 걷힐 때 restore가 함께 걷는다.
+// complete sets Complete. The cordoned-by-controller annotation stays —
+// the cordon is still ours, and restore takes it back when the drain label goes.
 func (r *NodeReconciler) complete(ctx context.Context, node *corev1.Node) error {
 	if node.Labels[LabelState] == StateComplete {
 		return nil
@@ -236,7 +236,7 @@ func (r *NodeReconciler) complete(ctx context.Context, node *corev1.Node) error 
 	return nil
 }
 
-// markTargets는 타깃에 pod-deletion-cost를 박는다 (DESIGN.md 2단계).
+// markTargets writes pod-deletion-cost on the targets (DESIGN.md step 2).
 func (r *NodeReconciler) markTargets(ctx context.Context, targets []target) error {
 	for _, t := range targets {
 		if t.pod.Annotations[AnnotationPodDeletionCost] == PodDeletionCost {
@@ -252,24 +252,24 @@ func (r *NodeReconciler) markTargets(ctx context.Context, targets []target) erro
 	return nil
 }
 
-// reconcileReplacements는 있어야 할 집합과 있는 집합을 맞춘다 (DESIGN.md 3단계).
-// 모자라면 만들고, 같은 타깃에 남으면 지운다. drain 중인 노드에 앉았거나
-// 롤아웃에 밀린 대체도 여기서 지운다 — 어느 쪽도 입양에 도달할 수 없다.
-// 그 삭제가 preconditions에 거부되면 retry를 돌려 라운드를 접는다 — 낡은
-// 명단이 넘기기까지 흘러가지 않게 하고, 다음 라운드가 새 상태에서 판정한다.
+// reconcileReplacements matches the set that should exist against the set that does
+// (DESIGN.md step 3). Too few, create; a surplus on the same target, delete. Replacements
+// seated on a draining node or superseded by a rollout are deleted here too — neither can
+// reach adoption. If such a deletion is rejected by its preconditions, a retry ends the
+// round, keeping a stale list out of hand-over so the next round decides from fresh state.
 func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1.Node, targets []target, replsByUID map[string][]*corev1.Pod) (retry bool, err error) {
 	log := logf.FromContext(ctx)
 	drainingNodes := map[string]bool{node.Name: true}
 	deploys := map[types.NamespacedName]*appsv1.Deployment{}
 	for _, t := range targets {
-		// terminating 타깃은 ReplicaSet이 이미 스스로 대체를 만들고 있다.
-		// 남아 있던 대체 Pod은 회수 경로(PodReconciler)가 같은 판정으로 지운다.
+		// A terminating target already has the ReplicaSet making its own replacement.
+		// Any replacement left over is deleted by the reclamation path (PodReconciler), same rule.
 		if t.pod.DeletionTimestamp != nil {
 			continue
 		}
 		uid := string(t.pod.UID)
 
-		// drain 중인 노드에 앉은 대체는 Ready 여부와 무관하게 지운다.
+		// A replacement seated on a draining node is deleted regardless of readiness.
 		var kept []*corev1.Pod
 		for _, repl := range replsByUID[uid] {
 			landed, err := r.nodeDraining(ctx, drainingNodes, repl.Spec.NodeName)
@@ -296,8 +296,8 @@ func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1
 		}
 		replsByUID[uid] = kept
 
-		// 타깃의 이주를 롤아웃이 대신 수행 중이면 대체를 지우고,
-		// 세대가 돌아올 때까지 만들지 않는다.
+		// If a rollout is performing the target's migration instead, delete the replacement
+		// and create none until the generation comes back.
 		superseded, err := r.supersededByRollout(ctx, deploys, t.rs)
 		if err != nil {
 			return false, err
@@ -336,8 +336,8 @@ func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1
 			log.Info("Created replacement Pod",
 				"pod", repl.Namespace+"/"+repl.Name, "target", t.pod.Namespace+"/"+t.pod.Name, "node", node.Name)
 		case len(kept) > 1:
-			// 제일 오래된 하나만 남긴다. 트림은 이 라운드의 넘기기가 방금 지운
-			// Pod을 다시 보지 않게 하기 위한 것이다.
+			// Keep only the oldest one. The trim exists so this round's hand-over does not
+			// look again at a Pod it just deleted.
 			for _, extra := range kept[1:] {
 				if _, err := deleteReplacement(ctx, r.Client, extra); err != nil {
 					return false, err
@@ -349,8 +349,8 @@ func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1
 	return false, nil
 }
 
-// handOver는 Ready인 대체 Pod에 hash를 붙여 ReplicaSet이 데려가게 한다 (DESIGN.md 4단계).
-// Deployment마다 따로 판정하고 준비된 것부터 넘긴다.
+// handOver attaches the hash to a Ready replacement so the ReplicaSet takes it (DESIGN.md step 4).
+// The decision is per Deployment, and whichever is ready hands over first.
 func (r *NodeReconciler) handOver(ctx context.Context, node *corev1.Node, targets []target, replsByUID map[string][]*corev1.Pod) error {
 	log := logf.FromContext(ctx)
 	healthyDeploys := map[types.NamespacedName]bool{}
@@ -358,7 +358,7 @@ func (r *NodeReconciler) handOver(ctx context.Context, node *corev1.Node, target
 		if t.pod.DeletionTimestamp != nil {
 			continue
 		}
-		// drain 중인 노드에 앉은 대체는 reconcileReplacements가 이미 지웠다
+		// replacements seated on a draining node were already deleted by reconcileReplacements
 		existing := replsByUID[string(t.pod.UID)]
 		if len(existing) == 0 {
 			continue
@@ -376,15 +376,15 @@ func (r *NodeReconciler) handOver(ctx context.Context, node *corev1.Node, target
 			continue
 		}
 
-		// hash는 타깃의 ReplicaSet에서 읽는다. 롤아웃 중이면 Deployment의 현재 RS가 아닐 수 있다.
+		// The hash is read from the target's ReplicaSet; during a rollout that may not be the current RS.
 		hash := t.rs.Labels[LabelPodTemplateHash]
 		if hash == "" {
-			// Deployment가 만든 RS에는 항상 hash 라벨이 있다. 여기 오면 비정상이므로 흔적을 남긴다.
+			// An RS created by a Deployment always has the hash label. Reaching here is abnormal, so leave a trace.
 			log.Info("Skipped handover because ReplicaSet has no pod-template-hash label",
 				"replicaset", t.rs.Namespace+"/"+t.rs.Name, "target", t.pod.Namespace+"/"+t.pod.Name)
 			continue
 		}
-		// patch 하나로 hash를 붙이고 replaces를 뗀다. 이 순간 소유가 ReplicaSet으로 넘어간다.
+		// One patch attaches the hash and removes replaces. Ownership passes to the ReplicaSet here.
 		patch := mergePatch(map[string]any{
 			"metadata": map[string]any{"labels": map[string]any{
 				LabelPodTemplateHash: hash,
@@ -470,18 +470,18 @@ func (r *NodeReconciler) nodeDraining(ctx context.Context, cache map[string]bool
 		}
 		return false, err
 	}
-	// Cancelled 노드는 열린 보통 노드라 착지해도 된다. Complete 노드는 사람이
-	// 리부팅하러 갈 노드라 여전히 막는다.
+	// A Cancelled node is an ordinary open node, so landing there is fine. A Complete node
+	// is one a human is about to reboot, so it stays banned.
 	cache[name] = drainActive(n)
 	return cache[name], nil
 }
 
-// supersededByRollout는 타깃의 이주를 롤아웃이 대신 수행 중인지 본다 (DESIGN.md 3단계).
-// paused면 템플릿이 달라도 롤아웃이 실제로 움직이지 않으므로 해당하지 않는다.
+// supersededByRollout reports whether a rollout is performing the target's migration (DESIGN.md step 3).
+// A paused rollout does not actually move, so it does not apply even if the templates differ.
 func (r *NodeReconciler) supersededByRollout(ctx context.Context, cache map[types.NamespacedName]*appsv1.Deployment, rs *appsv1.ReplicaSet) (bool, error) {
 	ref := metav1.GetControllerOf(rs)
 	if ref == nil {
-		// collectTargets가 ownedByDeployment를 통과한 RS만 넘기므로 도달하지 않는다
+		// unreachable: collectTargets only passes RSes that cleared ownedByDeployment
 		return false, nil
 	}
 	key := types.NamespacedName{Namespace: rs.Namespace, Name: ref.Name}
@@ -490,7 +490,7 @@ func (r *NodeReconciler) supersededByRollout(ctx context.Context, cache map[type
 		d = &appsv1.Deployment{}
 		if err := r.Reader.Get(ctx, key, d); err != nil {
 			if apierrors.IsNotFound(err) {
-				// Deployment가 사라지면 타깃도 곧 사라진다. 회수는 그 경로가 한다
+				// If the Deployment is gone the targets go soon after; that path does the reclamation
 				d = nil
 			} else {
 				return false, err
@@ -507,7 +507,7 @@ func (r *NodeReconciler) supersededByRollout(ctx context.Context, cache map[type
 func (r *NodeReconciler) deployHealthy(ctx context.Context, cache map[types.NamespacedName]bool, rs *appsv1.ReplicaSet) (bool, error) {
 	ref := metav1.GetControllerOf(rs)
 	if ref == nil {
-		// collectTargets가 ownedByDeployment를 통과한 RS만 넘기므로 도달하지 않는다
+		// unreachable: collectTargets only passes RSes that cleared ownedByDeployment
 		return false, nil
 	}
 	key := types.NamespacedName{Namespace: rs.Namespace, Name: ref.Name}
@@ -540,8 +540,8 @@ func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Complete(r)
 }
 
-// nodesForPod은 Pod 이벤트를 깨어날 노드로 바꾼다. 대체 Pod은 다른 노드에 떠 있어서
-// 어느 drain의 것인지 Pod만으로는 알 수 없으므로 drain 중인 노드 전부를 깨운다.
+// nodesForPod turns a Pod event into the nodes to wake. A replacement lives on another
+// node, and the Pod alone does not say which drain it belongs to, so every draining node wakes.
 func (r *NodeReconciler) nodesForPod(ctx context.Context, obj client.Object) []reconcile.Request {
 	pod, ok := obj.(*corev1.Pod)
 	if !ok {
@@ -551,7 +551,7 @@ func (r *NodeReconciler) nodesForPod(ctx context.Context, obj client.Object) []r
 	if pod.Labels[LabelReplaces] != "" {
 		nodes := &corev1.NodeList{}
 		if err := r.List(ctx, nodes, client.MatchingLabels{LabelDrain: "true"}); err != nil {
-			// 이 경로가 실패하면 진행이 주기적 requeue에만 의존하므로 흔적을 남긴다
+			// If this path fails, progress depends on the periodic requeue alone, so leave a trace
 			log.Error(err, "Failed to list draining nodes for replacement Pod event",
 				"pod", pod.Namespace+"/"+pod.Name)
 			return nil

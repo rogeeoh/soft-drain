@@ -19,9 +19,9 @@ limitations under the License.
 
 package e2e
 
-// e2e는 kcm과 스케줄러가 실제로 도는 유일한 층이다. 여기서 처음으로
-// ReplicaSet 입양과 초과분 삭제까지 포함한 전체 루프의 수렴을 본다.
-// 타이밍 경합 없이 결정론적으로 유도할 수 있는 시나리오만 담는다.
+// e2e is the only layer where the kcm and the scheduler actually run. This is where the
+// full loop — ReplicaSet adoption and surplus deletion included — is seen converging.
+// Only scenarios that can be induced deterministically, without timing races, live here.
 
 import (
 	"fmt"
@@ -59,14 +59,14 @@ func applyYAML(y string) {
 
 type workload struct {
 	name         string
-	replicas     int    // 0이면 1
-	pin          string // 비어 있지 않으면 그 노드에 nodeSelector로 고정
-	recreate     bool   // Recreate 전략 (롤아웃이 옛 Pod을 즉시 지운다)
+	replicas     int    // 0 means 1
+	pin          string // non-empty pins to that node with a nodeSelector
+	recreate     bool   // Recreate strategy (the rollout deletes the old Pod at once)
 	tolerate     bool   // node.kubernetes.io/unschedulable toleration
-	antiAffinity bool   // required podAntiAffinity(hostname) — 노드당 하나로 확산
-	readyDelay   int    // readiness initialDelaySeconds (0이면 1)
-	probeFile    string // 비어 있지 않으면 hostPath 파일 exec probe — 파일이 있는 노드에서만 Ready
-	pvc          string // 비어 있지 않으면 이 PVC를 마운트
+	antiAffinity bool   // required podAntiAffinity(hostname) — spread one per node
+	readyDelay   int    // readiness initialDelaySeconds (0 means 1)
+	probeFile    string // non-empty adds a hostPath file exec probe — Ready only on the node holding the file
+	pvc          string // non-empty mounts this PVC
 }
 
 func deployYAML(w workload) string {
@@ -282,7 +282,7 @@ func nodeUnschedulable(node string) string {
 	return strings.TrimSpace(out)
 }
 
-// podsOf는 원본이든 대체든 그 앱의 Pod 전부를 준다.
+// podsOf returns every Pod of that app, original or replacement.
 func podsOf(app string) []string {
 	out := mustKubectl("get", "pods", "-n", "default", "-l", "app="+app,
 		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`)
@@ -305,8 +305,8 @@ func podCost(name string) string {
 	return strings.TrimSpace(out)
 }
 
-// replacementPods는 그 앱의 대체 Pod만 센다. 클러스터 전역으로 세면
-// 다른 스펙이나 이전 실행이 남긴 것에 오염된다.
+// replacementPods counts only that app's replacements. Counting cluster-wide would be
+// polluted by leftovers from another spec or an earlier run.
 func replacementPods(app string) []string {
 	out := mustKubectl("get", "pods", "-n", "default", "-l", "soft-drain.com/replaces,app="+app,
 		"-o", `jsonpath={range .items[*]}{.metadata.name}{"\n"}{end}`)
@@ -335,7 +335,7 @@ func allWorkers() []string {
 	return workers
 }
 
-// pickWorker는 스케줄 가능한 워커 노드 하나를 고른다.
+// pickWorker picks one schedulable worker node.
 func pickWorker() string {
 	out := mustKubectl("get", "nodes",
 		"-o", `jsonpath={range .items[*]}{.metadata.name} {.spec.unschedulable}{"\n"}{end}`)
@@ -349,8 +349,8 @@ func pickWorker() string {
 	return ""
 }
 
-// cleanup은 best-effort다. 마지막 스펙의 DeferCleanup은 AfterAll(컨트롤러
-// undeploy) 뒤에 돌 수 있어 컨트롤러의 restore에 기대지 않고 직접 걷는다.
+// cleanup is best-effort. The last spec's DeferCleanup can run after AfterAll (which
+// undeploys the controller), so it takes things back itself instead of relying on restore.
 func cleanupDrainNode(node string) {
 	_, _ = kubectl("label", "node", node, "soft-drain.com/drain-")
 	_, _ = kubectl("label", "node", node, "soft-drain.com/state-")
@@ -360,8 +360,8 @@ func cleanupDrainNode(node string) {
 
 func cleanupApp(app string) {
 	_, _ = kubectl("delete", "deployment", "-n", "default", app, "--ignore-not-found", "--wait=false")
-	// 주인 없는 대체 Pod은 Deployment 삭제로 걷히지 않는다. 컨트롤러가 이미
-	// 내려간 뒤에도 남지 않도록 직접 지운다.
+	// An ownerless replacement is not collected by deleting the Deployment. Delete it here
+	// so nothing is left behind once the controller is gone.
 	_, _ = kubectl("delete", "pods", "-n", "default", "-l", "app="+app, "--ignore-not-found", "--wait=false")
 }
 
@@ -370,8 +370,8 @@ func cleanupDrain(node, app string) {
 	cleanupApp(app)
 }
 
-// deployPackedOnNode는 다른 워커를 잠시 cordon해서 워크로드 전체를 그 노드에
-// 앉힌다. nodeSelector 고정과 달리 대체 Pod은 자유롭게 다른 노드로 갈 수 있다.
+// deployPackedOnNode cordons the other workers briefly so the whole workload lands on
+// that node. Unlike a nodeSelector pin, replacements are free to go to another node.
 func deployPackedOnNode(w workload, node string) {
 	var others []string
 	for _, o := range allWorkers() {
@@ -393,8 +393,8 @@ func deployPackedOnNode(w workload, node string) {
 
 const controllerDeploy = "deploy/soft-drain-controller-manager"
 
-// startPinnedDrain은 노드에 고정된 워크로드를 만들고 drain을 걸어
-// "InProgress + Pending 대체 Pod 1개" 상태까지 끌고 간다.
+// startPinnedDrain creates a workload pinned to a node and starts a drain, driving it to
+// the state "InProgress with one Pending replacement".
 func startPinnedDrain(app, worker string, w workload) (origPod string) {
 	applyYAML(deployYAML(w))
 	mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
@@ -417,8 +417,8 @@ type availabilityMonitor struct {
 	violations []string
 }
 
-// watchAvailability는 각 Deployment의 availableReplicas와 Service Endpoints를
-// 주기적으로 샘플링해 의도한 개수 밑으로 떨어진 순간을 기록한다.
+// watchAvailability samples each Deployment's availableReplicas and the Service Endpoints
+// periodically, recording any moment either falls below the intended count.
 func watchAvailability(apps map[string]int) *availabilityMonitor {
 	m := &availabilityMonitor{stop: make(chan struct{}), done: make(chan struct{})}
 	go func() {
@@ -512,7 +512,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Eventually(func() string { return nodeStateLabel(srcNode) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
-		// 노드는 cordon된 채로 남는다
+		// the node stays cordoned
 		Expect(nodeUnschedulable(srcNode)).To(Equal("true"))
 
 		By("verifying the workload moved")
@@ -522,7 +522,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(pods[0]).NotTo(Equal(origPod))
 			g.Expect(nodeOfPod(pods[0])).NotTo(Equal(srcNode))
 			g.Expect(podPhase(pods[0])).To(Equal("Running"))
-			// ReplicaSet에 입양됐다: hash는 있고 replaces는 없다
+			// adopted by the ReplicaSet: the hash is there and replaces is gone
 			labels := mustKubectl("get", "pod", "-n", "default", pods[0], "-o", "jsonpath={.metadata.labels}")
 			g.Expect(labels).To(ContainSubstring("pod-template-hash"))
 			g.Expect(labels).NotTo(ContainSubstring("soft-drain.com/replaces"))
@@ -572,7 +572,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		const app = "sd-pending"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
-		// 모든 워커를 막을 수는 없으니 노드 고정으로 "갈 곳 없음"을 만든다
+		// not every worker can be blocked, so a node pin manufactures "nowhere to go"
 		origPod := startPinnedDrain(app, worker, workload{name: app, pin: worker})
 
 		Expect(podCost(origPod)).To(Equal("-2147483648"))
@@ -588,7 +588,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(podCost(origPod)).To(BeEmpty())
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 
-		// 원래 Pod은 건드리지 않았다
+		// the original Pod was left untouched
 		Expect(podsOf(app)).To(Equal([]string{origPod}))
 	})
 
@@ -612,7 +612,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Eventually(func() []string { return replacementPods(app) },
 			2*time.Minute, 3*time.Second).Should(BeEmpty())
 
-		// 원래 Pod은 건드리지 않았다
+		// the original Pod was left untouched
 		Expect(podsOf(app)).To(Equal([]string{origPod}))
 	})
 
@@ -651,8 +651,8 @@ var _ = Describe("soft-drain", Ordered, func() {
 		DeferCleanup(func() { cleanupDrain(worker, app) })
 		startPinnedDrain(app, worker, workload{name: app, pin: worker, recreate: true})
 
-		// Recreate가 옛 Pod(타깃)을 즉시 지운다. 새 Pod은 cordon된 노드에
-		// 고정돼 미스케줄 Pending이므로 타깃이 아니다.
+		// Recreate deletes the old Pod (the target) at once. The new Pod is pinned to the
+		// cordoned node and stays mis-scheduled Pending, so it is not a target.
 		By("triggering a Recreate rollout mid-drain")
 		mustKubectl("patch", "deployment", "-n", "default", app, "--type=merge",
 			"-p", `{"spec":{"template":{"metadata":{"labels":{"rollout":"v2"}}}}}`)
@@ -684,12 +684,12 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("patch", "deployment", "-n", "default", app, "--type=merge",
 			"-p", `{"spec":{"template":{"metadata":{"labels":{"rollout":"v2"}}}}}`)
 
-		// readiness 45초를 채우기 한참 전에 회수된다 — Ready를 기다렸다면 여기서 걸린다
+		// reclaimed long before the 45s readiness elapses — waiting for Ready would hang here
 		Eventually(func(g Gomega) {
 			out, err := kubectl("get", "pod", "-n", "default", stale,
 				"-o", "jsonpath={.metadata.deletionTimestamp}")
 			if err != nil {
-				// 이미 완전히 사라진 경우만 통과 — 일시적 API 오류는 통과가 아니다
+				// only a Pod that is fully gone passes — a transient API error is not a pass
 				g.Expect(err.Error()).To(ContainSubstring("NotFound"))
 				return
 			}
@@ -713,7 +713,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
 		srcNode := nodeOfPod(podsOf(app)[0])
 
-		// 착지를 결정론으로 만든다: land 하나만 남기고 나머지 워커는 손 cordon
+		// make the landing deterministic: keep only land and hand-cordon the other workers
 		var land string
 		var parked []string
 		for _, w := range allWorkers() {
@@ -749,12 +749,12 @@ var _ = Describe("soft-drain", Ordered, func() {
 		By("draining the node the replacement landed on")
 		mustKubectl("label", "node", land, "soft-drain.com/drain=true")
 
-		// readiness 45초를 채우기 한참 전에 회수된다
+		// reclaimed long before the 45s readiness elapses
 		Eventually(func(g Gomega) {
 			out, err := kubectl("get", "pod", "-n", "default", repl,
 				"-o", "jsonpath={.metadata.deletionTimestamp}")
 			if err != nil {
-				// 이미 완전히 사라진 경우만 통과 — 일시적 API 오류는 통과가 아니다
+				// only a Pod that is fully gone passes — a transient API error is not a pass
 				g.Expect(err.Error()).To(ContainSubstring("NotFound"))
 				return
 			}
@@ -773,7 +773,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			}
 			g.Expect(live).To(HaveLen(1))
 			g.Expect(live[0]).NotTo(Equal(repl))
-			// land에 잠깐 앉았다 회수되는 교차가 있어도 결국 Pending으로 수렴한다
+			// even if it briefly lands on land and is reclaimed, it converges to Pending
 			g.Expect(podPhase(live[0])).To(Equal("Pending"))
 		}, time.Minute, 2*time.Second).Should(Succeed())
 
@@ -812,8 +812,8 @@ var _ = Describe("soft-drain", Ordered, func() {
 		By("scaling up mid-drain")
 		mustKubectl("scale", "deployment", "-n", "default", app, "--replicas=3")
 
-		// 새 Pod들은 cordon된 노드에 고정돼 미스케줄 Pending — 타깃이 아니다.
-		// "타깃마다 하나"가 아니라 replicas 기준으로 만들었다면 여기서 초과 생성된다.
+		// the new Pods are pinned to the cordoned node and stay mis-scheduled Pending — not targets.
+		// Creating by replicas instead of "one per target" would over-create right here.
 		Consistently(func() []string { return replacementPods(app) },
 			45*time.Second, 5*time.Second).Should(HaveLen(1))
 		Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
@@ -847,8 +847,8 @@ var _ = Describe("soft-drain", Ordered, func() {
 			cleanupApp(app)
 		})
 
-		// 빈 워커들을 먼저 막는다. src를 먼저 라벨하면 대체 Pod이 아직 cordon
-		// 안 된 워커에 스케줄돼 교착 없이 그냥 끝나버린다.
+		// block the empty workers first. Labelling src first would let the replacement schedule
+		// onto a worker not yet cordoned and finish without ever deadlocking.
 		By("cordoning off every other worker first")
 		for _, w := range workers {
 			if w != src {
@@ -874,8 +874,8 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(podPhase(repls[0])).To(Equal("Pending"))
 		}, 3*time.Minute, 3*time.Second).Should(Succeed())
 
-		// Complete된 빈 워커 하나를 되돌린다. 라벨만 걷으면 컨트롤러가
-		// 자기가 걸었던 cordon도 함께 걷는다 — 여기서 그 동작이 교착을 푼다.
+		// give back one Complete empty worker. Removing just the label makes the controller take
+		// back the cordon it placed — that behaviour is what breaks the deadlock here.
 		var freed string
 		for _, w := range workers {
 			if w != src {
@@ -910,7 +910,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Eventually(func() string { return nodeStateLabel(src) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
-		// 우리가 건 cordon이 아니므로 어노테이션이 없다
+		// not a cordon we placed, so there is no annotation
 		ann, _ := kubectl("get", "node", src,
 			"-o", `jsonpath={.metadata.annotations.soft-drain\.com/cordoned-by-controller}`)
 		Expect(strings.TrimSpace(ann)).To(BeEmpty())
@@ -935,7 +935,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
-		// naked pod은 타깃이 아니므로 노드는 곧바로 Complete가 된다
+		// a naked pod is not a target, so the node goes Complete right away
 		Eventually(func() string { return nodeStateLabel(worker) },
 			2*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -993,14 +993,14 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
 		origPod := podsOf(app)[0]
 
-		// 이전 스펙이나 실행이 남긴 같은 reason의 이벤트에 오염되지 않게 지우고 시작한다
+		// start clean so events with the same reason from an earlier spec or run do not pollute it
 		_, _ = kubectl("delete", "events", "-n", "default",
 			"--field-selector", "reason=ReplacementOnDrainingNode", "--ignore-not-found")
 
 		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
-		// 대체 Pod이 cordon을 뚫고 같은 노드에 앉아 Ready가 되면 지워지고,
-		// 다음 라운드가 다시 만든다. 반복 Warning Event가 그 증거다.
+		// a replacement that gets through the cordon onto the same node is deleted once Ready,
+		// and the next round creates another. The repeating Warning Events are the evidence.
 		By("waiting for the landing-deletion loop to leave evidence")
 		Eventually(func(g Gomega) {
 			out, _ := kubectl("get", "events", "-n", "default",
@@ -1008,12 +1008,12 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(nonEmptyLines(out)).NotTo(BeEmpty())
 		}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-		// 옮기지 못하므로 InProgress에 머물고, 원래 Pod은 산다
+		// it cannot be moved, so this stays InProgress and the original Pod lives
 		Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
 		Expect(podsOf(app)).To(ContainElement(origPod))
 	})
 
-	// ─── 다중 replicas ───
+	// ─── multiple replicas ───
 
 	It("r=3 packed on one node moves all three without downtime", Label("shard-d"), func() {
 		const app = "sd-pack"
@@ -1063,7 +1063,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(violations).To(BeEmpty(),
 			"availability dropped during drain:\n%s", strings.Join(violations, "\n"))
 
-		// 다른 노드의 Pod은 이름(오브젝트)까지 그대로다 — 엉뚱한 Pod을 안 죽였다
+		// the Pod on the other node is identical down to its name (the object) — no wrong Pod was killed
 		for name, node := range untouched {
 			Expect(podPhase(name)).To(Equal("Running"))
 			Expect(nodeOfPod(name)).To(Equal(node))
@@ -1123,7 +1123,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			g.Expect(podPhase(repls[0])).To(Equal("Pending"))
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 
-		// "먼저 띄우고 나중에 지운다" 방식 전체의 산술 — 막힌 채 유지된다
+		// the arithmetic of "bring it up first, delete it later" in general — it stays blocked
 		Consistently(func() string { return nodeStateLabel(src) },
 			30*time.Second, 5*time.Second).Should(Equal("InProgress"))
 
@@ -1134,7 +1134,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	// ─── 방해 행위자 ───
+	// ─── disruptive actors ───
 
 	It("a controller restart mid-drain resumes without duplicates", Label("shard-c"), func() {
 		const app = "sd-restart"
@@ -1146,13 +1146,13 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("rollout", "restart", "-n", namespace, controllerDeploy)
 		mustKubectl("rollout", "status", "-n", namespace, controllerDeploy, "--timeout=120s")
 
-		// 무기억이라 재기동 후에도 같은 판정 — 대체 Pod이 늘지도 줄지도 않는다
+		// memoryless, so the decision after a restart is the same — no replacement is added or lost
 		Consistently(func(g Gomega) {
 			g.Expect(replacementPods(app)).To(HaveLen(1))
 			g.Expect(nodeStateLabel(worker)).To(Equal("InProgress"))
 		}, 30*time.Second, 5*time.Second).Should(Succeed())
 
-		// 재기동한 컨트롤러가 취소도 처리한다
+		// the restarted controller handles the cancel too
 		mustKubectl("label", "node", worker, "soft-drain.com/drain-")
 		Eventually(func(g Gomega) {
 			g.Expect(nodeStateLabel(worker)).To(BeEmpty())
@@ -1185,7 +1185,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("scale", "-n", namespace, controllerDeploy, "--replicas=1")
 		mustKubectl("rollout", "status", "-n", namespace, controllerDeploy, "--timeout=120s")
 
-		// watch는 edge가 아니라 level이다 — 놓친 이벤트 없이 현재 상태에서 수렴한다
+		// a watch is level, not edge — it converges from the current state with no missed events
 		Eventually(func() string { return nodeStateLabel(src) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 		Eventually(func(g Gomega) {
@@ -1211,9 +1211,9 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
-		// Complete는 옛 컨트롤러 Pod 오브젝트가 사라진 뒤에만 붙을 수 있고,
-		// 그 시점에 옛 인스턴스는 이미 죽어 있다 — 이주한 새 인스턴스가
-		// 리더 리스를 이어받아 루프를 계속한다는 증명이다.
+		// Complete can only be set after the old controller Pod object is gone, and by then the
+		// old instance is already dead — proof that the migrated instance took over the leader
+		// lease and kept the loop running.
 		Eventually(func() string { return nodeStateLabel(src) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -1276,7 +1276,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			cleanupDrain(src, app)
 		})
 
-		// pause + 템플릿 변경으로 Healthy(D)를 거짓으로 고정한다
+		// pause plus a template change pins Healthy(D) to false
 		By("pausing the deployment with a pending template change")
 		mustKubectl("rollout", "pause", "-n", "default", "deploy/"+app)
 		mustKubectl("patch", "deployment", "-n", "default", app, "--type=merge",
@@ -1284,7 +1284,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
-		// 대체 Pod이 Ready가 되어도 replaces 라벨을 단 채 남아 있어야 한다
+		// the replacement must stay, replaces label and all, even once it is Ready
 		By("verifying the handover is deferred")
 		Eventually(func() []string { return replacementPods(app) },
 			2*time.Minute, 3*time.Second).Should(HaveLen(1))
@@ -1337,7 +1337,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	// ─── 워크로드 다양성 ───
+	// ─── workload variety ───
 
 	It("a forever-unready replacement never costs the original its life", Label("shard-d"), func() {
 		const app = "sd-noready"
@@ -1347,7 +1347,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 			_, _ = utils.Run(exec.Command("docker", "exec", worker, "rm", "-rf", "/var/lib/sd-e2e"))
 		})
 
-		// 이 노드에만 marker 파일을 만든다 — 대체 Pod은 어디에 앉든 Ready가 못 된다
+		// the marker file exists only on this node — a replacement can never be Ready wherever it lands
 		By("planting the readiness marker on one node only")
 		_, err := utils.Run(exec.Command("docker", "exec", worker,
 			"sh", "-c", "mkdir -p /var/lib/sd-e2e && touch /var/lib/sd-e2e/ready"))
@@ -1359,7 +1359,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		monitor := watchAvailability(map[string]int{app: 1})
 		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
-		// 대체 Pod이 생기고, Ready가 못 되니 넘기기가 영영 일어나지 않는다
+		// a replacement appears, and since it never goes Ready the hand-over never happens
 		Eventually(func() []string { return replacementPods(app) },
 			2*time.Minute, 3*time.Second).Should(HaveLen(1))
 		Consistently(func(g Gomega) {
@@ -1404,7 +1404,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
-		// PV의 노드 어피니티가 cordon된 노드를 가리켜 대체 Pod이 영영 Pending이다
+		// the PV's node affinity points at the cordoned node, so the replacement is Pending forever
 		Eventually(func(g Gomega) {
 			repls := replacementPods(app)
 			g.Expect(repls).To(HaveLen(1))
@@ -1444,7 +1444,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 
 		mustKubectl("label", "node", worker, "soft-drain.com/drain=true")
 
-		// 셋 다 타깃이 아니므로 노드는 곧바로 Complete가 된다
+		// none of the three is a target, so the node goes Complete right away
 		Eventually(func() string { return nodeStateLabel(worker) },
 			2*time.Minute, 3*time.Second).Should(Equal("Complete"))
 
@@ -1516,7 +1516,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("uncordon", worker)
 		Eventually(func() string { return nodeStateLabel(worker) },
 			60*time.Second, 2*time.Second).Should(Equal("Cancelled"))
-		// Cancelled 래치는 플러그인이 걷고 다시 건다 — 재drain은 새 drain과 같다
+		// the plugin removes and re-adds the Cancelled latch — a re-drain is just a new drain
 		out, err = utils.Run(exec.Command(plugin, worker, "--wait=false", "--timeout", "2m"))
 		Expect(err).NotTo(HaveOccurred(), out)
 		Expect(out).To(ContainSubstring("clearing it first"))
@@ -1573,13 +1573,13 @@ var _ = Describe("soft-drain", Ordered, func() {
 		Expect(err).NotTo(HaveOccurred(), out)
 		for _, o := range two {
 			Expect(nodeStateLabel(o)).To(BeEmpty())
-			// release는 우리가 걸었던 cordon도 걷는다 — 복원 patch가 원자적이라
-			// state가 비었으면 uncordon도 끝나 있다
+			// release also takes back the cordon we placed — the restore patch is atomic, so an
+			// empty state means the uncordon is done too
 			Expect(nodeUnschedulable(o)).To(BeEmpty())
 		}
 
 		By("draining to completion in blocking mode")
-		applyYAML(deployYAML(workload{name: app})) // 고정 해제 — 이제 갈 곳이 있다
+		applyYAML(deployYAML(workload{name: app})) // unpinned — there is somewhere to go now
 		mustKubectl("rollout", "status", "-n", "default", "deploy/"+app, "--timeout=180s")
 		var src string
 		Eventually(func(g Gomega) {
@@ -1633,7 +1633,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}
 		mustKubectl("label", "node", src, "soft-drain.com/drain=true")
 
-		// 접기 전 규칙이라면 대체 Pod이 착지하는 족족 지워져 영원히 안 끝난다
+		// under the pre-fold rule the replacement would be deleted as fast as it lands and never finish
 		Eventually(func() string { return nodeStateLabel(src) },
 			3*time.Minute, 3*time.Second).Should(Equal("Complete"))
 		Eventually(func(g Gomega) {

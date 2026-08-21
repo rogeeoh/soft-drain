@@ -39,7 +39,7 @@ const (
 	AnnotationCordoned        = "soft-drain.com/cordoned-by-controller"
 	AnnotationPodDeletionCost = "controller.kubernetes.io/pod-deletion-cost"
 
-	// int32 최솟값. 이 값을 쓰는 게 우리뿐이라 값이 이것이면 우리가 붙인 것이다.
+	// The int32 minimum. Nothing else writes this value, so a Pod carrying it is ours.
 	PodDeletionCost = "-2147483648"
 
 	LabelPodTemplateHash = appsv1.DefaultDeploymentUniqueLabelKey
@@ -53,13 +53,13 @@ func draining(node *corev1.Node) bool {
 	return node.Labels[LabelDrain] == "true"
 }
 
-// drainActive는 그 노드의 drain이 실제로 진행 중인지 본다. Cancelled 노드는
-// uncordon된 보통 노드다 — 대체 Pod을 유지할 이유도, 착지를 막을 이유도 없다.
+// drainActive reports whether the node's drain is actually running. A Cancelled node
+// is an ordinary uncordoned node — no reason to keep replacements or to ban landings.
 func drainActive(node *corev1.Node) bool {
 	return draining(node) && node.Labels[LabelState] != StateCancelled
 }
 
-// replicaSetRef는 Pod의 controller가 apps/v1 ReplicaSet일 때 그 참조를 준다.
+// replicaSetRef returns the reference when the Pod's controller is an apps/v1 ReplicaSet.
 func replicaSetRef(pod *corev1.Pod) *metav1.OwnerReference {
 	ref := metav1.GetControllerOf(pod)
 	if ref == nil || ref.Kind != "ReplicaSet" || ref.APIVersion != "apps/v1" {
@@ -73,7 +73,7 @@ func ownedByDeployment(rs *appsv1.ReplicaSet) bool {
 	return ref != nil && ref.Kind == "Deployment" && ref.APIVersion == "apps/v1"
 }
 
-// validReplacement는 DESIGN.md 3단계의 "있는 것" 판정이다.
+// validReplacement is the "does exist" test of DESIGN.md step 3.
 func validReplacement(pod *corev1.Pod) bool {
 	return pod.Labels[LabelReplaces] != "" &&
 		metav1.GetControllerOf(pod) == nil &&
@@ -91,16 +91,16 @@ func podReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// deploymentHealthy는 DESIGN.md 4단계의 Healthy(D) 판정이다.
-// replicas == updatedReplicas 항이 "Pod을 가진 ReplicaSet이 하나뿐"을 잡는다.
+// deploymentHealthy is the Healthy(D) test of DESIGN.md step 4.
+// The replicas == updatedReplicas term catches "only one ReplicaSet has Pods".
 func deploymentHealthy(d *appsv1.Deployment) bool {
 	return d.Status.ObservedGeneration >= d.Generation &&
 		d.Status.Replicas == d.Status.UpdatedReplicas &&
 		d.Status.AvailableReplicas >= ptr.Deref(d.Spec.Replicas, 1)
 }
 
-// templatesEqualIgnoreHash는 Deployment 컨트롤러의 EqualIgnoreHash와 같은 비교다.
-// pod-template-hash 라벨만 빼고 같으면 rs는 그 Deployment의 현재 세대다.
+// templatesEqualIgnoreHash is the same comparison as the Deployment controller's EqualIgnoreHash.
+// Equal but for the pod-template-hash label means rs is that Deployment's current generation.
 func templatesEqualIgnoreHash(a, b *corev1.PodTemplateSpec) bool {
 	a2, b2 := a.DeepCopy(), b.DeepCopy()
 	delete(a2.Labels, LabelPodTemplateHash)
@@ -108,8 +108,8 @@ func templatesEqualIgnoreHash(a, b *corev1.PodTemplateSpec) bool {
 	return apiequality.Semantic.DeepEqual(a2, b2)
 }
 
-// buildReplacement는 rs.spec.template에서 대체 Pod을 만든다.
-// 살아 있는 Pod을 베끼면 nodeName과 webhook이 넣은 사이드카가 따라온다.
+// buildReplacement builds a replacement Pod from rs.spec.template.
+// Copying the living Pod would bring nodeName and webhook-injected sidecars along.
 func buildReplacement(rs *appsv1.ReplicaSet, targetUID types.UID) *corev1.Pod {
 	tpl := rs.Spec.Template.DeepCopy()
 
@@ -117,13 +117,13 @@ func buildReplacement(rs *appsv1.ReplicaSet, targetUID types.UID) *corev1.Pod {
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	// rs.spec.template.metadata.labels에는 hash가 이미 들어 있다.
-	// hash가 있으면 ReplicaSet이 Pending인 Pod을 데려가서 그 Pod부터 지운다.
+	// rs.spec.template.metadata.labels already carries the hash.
+	// With the hash the ReplicaSet adopts a Pending Pod and deletes that one first.
 	delete(labels, LabelPodTemplateHash)
 	labels[LabelReplaces] = string(targetUID)
 
-	// pod-deletion-cost는 타깃에만 쓴다. 대체 Pod에 남으면 입양 후
-	// 다음 스케일다운마다 그 Pod이 1순위로 죽는다.
+	// pod-deletion-cost is for targets only. Left on a replacement, that Pod dies first
+	// in every scale-down after adoption.
 	return &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			GenerateName: rs.Name + "-",
@@ -147,14 +147,14 @@ func sortPodsByAge(pods []*corev1.Pod) {
 func mergePatch(doc map[string]any) client.Patch {
 	raw, err := json.Marshal(doc)
 	if err != nil {
-		panic(err) // map[string]any 리터럴만 들어오므로 도달 불가
+		panic(err) // unreachable: only map[string]any literals are passed in
 	}
 	return client.RawPatch(types.MergePatchType, raw)
 }
 
-// deleteReplacement는 읽었던 UID와 resourceVersion을 preconditions로 걸어 지운다.
-// 판정과 삭제 사이에 hash가 붙어 ReplicaSet이 데려간 Pod이면 resourceVersion이
-// 바뀌어 삭제가 거부된다(deleted=false). 다음 라운드가 다시 판정한다.
+// deleteReplacement deletes with the UID and resourceVersion we read as preconditions.
+// If the hash was attached in between and a ReplicaSet took the Pod, the resourceVersion
+// changed and the deletion is rejected (deleted=false). The next round decides again.
 func deleteReplacement(ctx context.Context, c client.Writer, pod *corev1.Pod) (deleted bool, err error) {
 	err = c.Delete(ctx, pod, client.Preconditions{UID: &pod.UID, ResourceVersion: &pod.ResourceVersion})
 	switch {

@@ -1,5 +1,5 @@
-// kubectl-soft_drain은 kubectl 플러그인이다 (kubectl soft-drain 으로 호출).
-// 쓰는 것은 drain 라벨 하나뿐이고 나머지는 읽기다.
+// kubectl-soft_drain is a kubectl plugin (invoked as kubectl soft-drain).
+// The only thing it writes is the drain label; everything else is a read.
 package main
 
 import (
@@ -27,7 +27,7 @@ import (
 
 const pollInterval = 2 * time.Second
 
-// version은 빌드 시 -ldflags "-X main.version=..."로 주입된다.
+// version is injected at build time with -ldflags "-X main.version=...".
 var version = "dev"
 
 func main() {
@@ -35,8 +35,8 @@ func main() {
 	if err == nil {
 		return
 	}
-	// Ctrl-C는 실패가 아니라 분리다 — 라벨은 남고 작업은 계속된다.
-	// 종료코드 130(128+SIGINT)으로 "완주 안 됨"만 관례대로 알린다.
+	// Ctrl-C is a detach, not a failure — the label stays and the work continues.
+	// Exit code 130 (128+SIGINT) reports only "did not run to completion", as is conventional.
 	if errors.Is(err, context.Canceled) {
 		fmt.Fprintln(os.Stderr, "interrupted; the operation keeps running on the cluster (labels remain)")
 		fmt.Fprintln(os.Stderr, "check with: kubectl soft-drain status")
@@ -52,8 +52,9 @@ func run() error {
 	timeout := flags.Duration("timeout", 0,
 		"give up waiting after this duration (0 = wait forever; the operation itself keeps running)")
 	output := flags.StringP("output", "o", "", "status output format: json or yaml")
-	// nil인 필드는 플래그로 등록되지 않는다. 연결 선택(--kubeconfig, --context)만
-	// 남긴다 — 이 플러그인에 네임스페이스나 고급 연결 플래그는 의미가 없다.
+	// A nil field is not registered as a flag. Only the connection selectors
+	// (--kubeconfig, --context) are kept — namespaces and advanced connection flags mean
+	// nothing to this plugin.
 	cfg := genericclioptions.NewConfigFlags(true)
 	cfg.CacheDir = nil
 	cfg.ClusterName = nil
@@ -96,7 +97,7 @@ the label and restores the node fully.
 		flags.Usage()
 		return nil
 	}
-	// version은 클러스터 없이도 답해야 한다 — 클라이언트 생성보다 먼저 본다.
+	// version must answer without a cluster — checked before the client is built.
 	if args[0] == "version" {
 		fmt.Printf("kubectl-soft_drain %s\n", version)
 		return nil
@@ -136,7 +137,7 @@ the label and restores the node fully.
 		}
 		err2 = runDrain(ctx, cs, args, *waitDone)
 	}
-	// 어느 지점에서 끊겼든, 신호가 원인이면 실패가 아니라 분리다.
+	// Wherever it was interrupted, a signal means a detach, not a failure.
 	if err2 != nil && sigCtx.Err() != nil {
 		return context.Canceled
 	}
@@ -164,8 +165,8 @@ type nodeStatus struct {
 	Replacements []replacementStatus `json:"replacements"`
 }
 
-// runStatus는 soft-drain이 관여 중인 노드의 현황이다. 전부 읽기다.
-// 노드명 목록만 필요한 기계는 라벨 조회가 정석이다:
+// runStatus reports on the nodes soft-drain is managing. Reads only.
+// A machine that just needs node names should query labels, as usual:
 // kubectl get nodes -l soft-drain.com/state=Complete -o name
 func runStatus(ctx context.Context, cs kubernetes.Interface, filter []string, output string) error {
 	if output != "" && output != "json" && output != "yaml" {
@@ -294,7 +295,7 @@ func runDrain(ctx context.Context, cs kubernetes.Interface, nodes []string, wait
 				fmt.Printf("node/%s is already drained (state=Complete)\n", node)
 				continue
 			case sd.StateCancelled:
-				// Cancelled는 래치다 — 라벨을 걷어 복원시킨 뒤에만 다시 걸 수 있다.
+				// Cancelled is a latch — the label must be removed to restore before it can be set again.
 				fmt.Printf("node/%s has a cancelled drain; clearing it first\n", node)
 				if err := setDrainLabel(ctx, cs, node, false); err != nil {
 					return err
@@ -402,8 +403,8 @@ func watchDrains(ctx context.Context, cs kubernetes.Interface, nodes []string) e
 	return nil
 }
 
-// diagnose는 "막혔을 때 보는 법"의 자동화다 — Pending 대체 Pod의 스케줄러
-// 메시지를 그대로 보여준다.
+// diagnose automates "reading a stuck node" — it shows the scheduler's message for
+// Pending replacements verbatim.
 func diagnose(cs kubernetes.Interface, node string, seenTargets map[types.UID]string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -426,8 +427,8 @@ func diagnose(cs kubernetes.Interface, node string, seenTargets map[types.UID]st
 	}
 }
 
-// runRelease는 라벨을 걷는다. 진행 중이면 취소가 되고, Complete면 관리 종료가
-// 된다 — 실체는 같은 동작이다.
+// runRelease removes the label. On a drain in progress that is a cancel, on a Complete
+// node it ends management — underneath it is the same action.
 func runRelease(ctx context.Context, cs kubernetes.Interface, nodes []string, waitDone bool) error {
 	var pending []string
 	for _, node := range nodes {
@@ -489,8 +490,8 @@ func waitForState(ctx context.Context, cs kubernetes.Interface, node, want strin
 	}
 }
 
-// markedPods는 노드 위에서 컨트롤러가 cost를 박은 Pod을 준다. 값이
-// -2147483648이면 우리가 붙인 것이다 — 그 값을 쓰는 게 우리뿐이다.
+// markedPods returns the Pods on the node the controller wrote a cost on. A value of
+// -2147483648 is ours — nothing else writes it.
 func markedPods(ctx context.Context, cs kubernetes.Interface, node string) ([]corev1.Pod, error) {
 	list, err := cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: "spec.nodeName=" + node,

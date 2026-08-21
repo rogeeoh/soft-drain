@@ -217,5 +217,5 @@ make test-e2e    # kind cluster, ~15 min
 
 ## Design
 
-The full design rationale lives in [DESIGN.md](DESIGN.md) (Korean; English translation
-planned). It is the source of truth for how the controller behaves.
+The full design rationale lives in [DESIGN.md](DESIGN.md) — the source of truth for how the
+controller behaves. A Korean translation is kept in [DESIGN.ko.md](DESIGN.ko.md).
