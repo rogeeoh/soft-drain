@@ -31,12 +31,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
-// PodReconciler는 대체 Pod을 키로 하는 회수 경로다 (DESIGN.md 3단계).
-// ReplicaSet prune으로 타깃이 사라지면 노드 순회로는 대체 Pod을 쳐다볼 일이 없어서
-// 대체 Pod 자체에서 출발하는 경로가 따로 있어야 한다. 판정은 같다.
+// PodReconciler is the reclamation path keyed on the replacement Pod (DESIGN.md step 3).
+// When a pruned ReplicaSet takes the targets with it, the node traversal never looks at
+// the replacements again, so a path starting from the replacement itself is required.
+// The decision is the same.
 type PodReconciler struct {
 	client.Client
-	// Reader는 API 서버를 직접 읽는다.
+	// Reader reads straight from the API server.
 	Reader client.Reader
 }
 
@@ -53,7 +54,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	if uid == "" || pod.DeletionTimestamp != nil {
 		return ctrl.Result{}, nil
 	}
-	// controller ownerRef가 있는 Pod은 지우지 않는다
+	// Pods with a controller ownerRef are never deleted
 	if metav1.GetControllerOf(pod) != nil {
 		return ctrl.Result{}, nil
 	}
@@ -63,7 +64,7 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 		return ctrl.Result{}, err
 	}
 	if needed {
-		// 취소나 타깃 eviction은 이 Pod의 이벤트를 만들지 않으므로 주기적으로 다시 판정한다
+		// Cancellation and target eviction produce no event for this Pod, so re-decide periodically
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	}
 	deleted, err := deleteReplacement(ctx, r.Client, pod)
@@ -76,9 +77,9 @@ func (r *PodReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.R
 	return ctrl.Result{}, nil
 }
 
-// replacementNeeded는 타깃이 살아서 drain 중인 노드에 있는지 본다.
+// replacementNeeded reports whether the target is alive and on a draining node.
 func (r *PodReconciler) replacementNeeded(ctx context.Context, repl *corev1.Pod, uid types.UID) (bool, error) {
-	// 죽은 대체 Pod은 Ready가 될 수도 입양될 수도 없다
+	// A dead replacement can neither become Ready nor be adopted
 	if repl.Status.Phase == corev1.PodFailed || repl.Status.Phase == corev1.PodSucceeded {
 		return false, nil
 	}
@@ -109,7 +110,7 @@ func (r *PodReconciler) replacementNeeded(ctx context.Context, repl *corev1.Pod,
 		}
 		return false, err
 	}
-	// Cancelled 노드의 drain은 끝난 것이다 — 대체 Pod을 유지할 이유가 없다
+	// A Cancelled node's drain is over — no reason to keep the replacement
 	return drainActive(node), nil
 }
 

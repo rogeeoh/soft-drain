@@ -1,39 +1,69 @@
-# soft-drain 작업 규칙
+# soft-drain working rules
 
-이 문서는 작업 규칙만 담는다. 설계는 전부 DESIGN.md에 있다.
+This file holds working rules only. The design lives entirely in DESIGN.md.
 
 ## SSOT
 
-- **DESIGN.md가 유일한 설계 규범이다.** 코드와 다르면 코드가 틀린 것이다. 설계 자체가 틀렸다고 판단되면 DESIGN.md를 고치는 게 아니라 사용자에게 보고한다. DESIGN.md 수정은 사용자 승인이 있을 때만 한다.
-- AGENTS.md는 kubebuilder가 생성한 범용 안내서다. DESIGN.md나 이 문서와 충돌하면 무시한다. 특히 CRD/api 디렉토리 관련 내용은 이 프로젝트에 해당 없다 — `api/`와 `config/crd`가 없는 것이 의도된 상태다.
+- **DESIGN.md is the only design norm.** If the code disagrees with it, the code is wrong. If
+  the design itself looks wrong, report it to the user rather than editing DESIGN.md. DESIGN.md
+  is modified only with the user's approval.
+- **DESIGN.ko.md is a translation, not a norm.** A design change touches both files in the same
+  commit, and CI rejects a PR that moves one without the other. Where they disagree, DESIGN.md
+  is right. Keep the section order and numbering identical so the two can be diffed against
+  each other.
+- AGENTS.md is the generic guide kubebuilder generated. Ignore it wherever it conflicts with
+  DESIGN.md or this file. Its CRD and `api/` directory material does not apply here — the
+  absence of `api/` and `config/crd` is intended.
 
-## 금지
+## Prohibited
 
-- **CRD를 만들지 않는다. 제안도 하지 않는다.** 노드 라벨이 유일한 API다.
-- **문서화된 K8s 동작을 클러스터에서 재검증하지 않는다.** ReplicaSet adoption, pod-deletion-cost 정렬 등은 이미 검증됐다.
-- **실 클러스터에 접근하지 않는다.** 테스트는 kind 클러스터(`soft-drain-test-e2e`)만 쓴다. 사용자의 kubeconfig 컨텍스트를 실 클러스터로 바꾸지 않는다.
-- 리뷰 에이전트는 **읽기 전용**이다. 코드를 고치지 말고 발견만 보고한다. 확신이 없으면 스스로 결정하지 말고 보고서에 올린다.
+- **No CRDs, and do not propose one.** Node labels are the only API.
+- **Do not re-verify documented Kubernetes behaviour against a cluster.** ReplicaSet adoption,
+  pod-deletion-cost ordering and the like are settled.
+- **Do not touch a real cluster.** Tests use the kind cluster (`soft-drain-test-e2e`) only.
+  Never point the user's kubeconfig context at a real cluster.
+- Review agents are **read-only**. Report findings, do not fix code. When unsure, put it in the
+  report instead of deciding alone.
 
-## 테스트 3층
+## The three test layers
 
-| 층 | 명령 | 검증 대상 |
+| Layer | Command | What it verifies |
 |---|---|---|
-| 유닛 | `go test ./internal/...` | 순수 판정 함수. 클러스터 없음 |
-| envtest | `make test` | 우리 컨트롤러가 API 서버에 **쓰는 것** |
-| e2e | `make test-e2e` | kind 멀티노드에서 전체 루프의 수렴 |
+| unit | `go test ./internal/...` | pure decision functions, no cluster |
+| envtest | `make test` | what our controller **writes** to the API server |
+| e2e | `make test-e2e` | the whole loop converging on a multi-node kind cluster |
 
-envtest에는 kube-controller-manager와 scheduler가 없다. ReplicaSet 입양·삭제·스케줄링은 일어나지 않으므로 거기서 검증하려 들지 않는다. 그건 e2e에서만 보이고, e2e에서도 RS 동작 자체가 아니라 우리 컨트롤러의 결과(Pod이 옮겨지고 Complete가 붙는가)를 본다.
+envtest has no kube-controller-manager and no scheduler. ReplicaSet adoption, deletion and
+scheduling do not happen there, so do not try to verify them there. They are visible in e2e
+only, and even there what is checked is our controller's outcome — the Pod moved, Complete was
+set — not ReplicaSet behaviour itself.
 
-타이밍 경합도 테스트한다. 다만 층이 다르다 — 경합의 교차 순서를 밖에서 제어할 수 없는 e2e에서 경합을 "발생"시키려 하면 안 일어난 채 통과(거짓 안심)하거나 가끔 실패(flaky)한다. 경합은 envtest·유닛에서 교차를 손으로 배열해 결정론적으로 검증하고(예: 판정↔삭제 사이의 넘기기, 넘긴 뒤 타깃 생존), e2e는 결정론적으로 유도되는 시나리오를 담는다: 정상 경로, 다중 Deployment 무중단 감시, 취소 2종(라벨 제거·uncordon), 자원 부족 Pending, 롤아웃 겹침 3종(stale 대체 조기 회수 포함), Deployment 삭제, 스케일업·스케일 0, 전 워커 drain 교착·해소, 선점 cordon 소유권, 비대상 Pod 불가침, 연쇄 재-drain, 착지 노드 drain 시 조기 회수, tolerate 착지-삭제 반복, 컨트롤러 자기 자신 drain, kubectl 플러그인 경로, Complete 후 uncordon 복귀.
+Timing races are tested too, but at a different layer. e2e cannot control the interleaving from
+outside, so trying to *produce* a race there either passes because it never happened (false
+comfort) or fails now and then (flaky). Races are arranged by hand and verified
+deterministically in envtest and unit tests — a hand-over between the decision and the
+deletion, a target surviving a hand-over. e2e carries the scenarios that can be induced
+deterministically: the happy path, uninterrupted watching of several Deployments, both
+cancellations (label removal, uncordon), Pending on insufficient resources, three
+rollout-overlap cases (including early reclamation of a stale replacement), Deployment
+deletion, scale-up and scale-to-zero, the all-workers-drained deadlock and its release,
+preemptive cordon ownership, non-target Pods left untouched, cascading re-drain, early
+reclamation when the landing node is drained, the tolerate land-and-delete loop, the controller
+draining itself, the kubectl plugin path, and the return to uncordon after Complete.
 
-## 리뷰 절차
+## Review procedure
 
-- 구현은 메인 세션이 단독으로 한다. 리뷰 에이전트는 체크포인트(컨트롤러 하나 완성, 커밋 직전)마다 새로 소집한다.
-- 리뷰어 소집 프롬프트: "CLAUDE.md 규칙 하에 DESIGN.md 대비 이 코드를 리뷰하라."
-- 발견은 REVIEW.md에 쌓고 사용자와 **하나씩** 검토한 뒤 반영한다. 리뷰 라운드는 체크포인트당 최대 2회.
+- Implementation is done by the main session alone. Review agents are convened fresh at each
+  checkpoint: one controller finished, or just before a commit.
+- Reviewer prompt: "Review this code against DESIGN.md under the rules in CLAUDE.md."
+- Findings accumulate in REVIEW.md and are gone through with the user **one at a time** before
+  being applied. At most two review rounds per checkpoint.
 
-## 문서·코드 스타일
+## Documentation and code style
 
-- 한국어 문서는 장황하게 쓰지 않고, 번역체를 쓰지 않고, 히스토리("과거에 이랬지만")를 서술하지 않는다.
-- 커밋 메시지와 테스트 스펙명 등 CI에 드러나는 텍스트는 영어로 쓴다.
-- 코드 주석은 코드가 보여줄 수 없는 제약만 적는다. 로그는 K8s 컨벤션(대문자 시작, 마침표 없음, 과거형)을 따른다.
+- Documents are not verbose, do not read like translations, and do not narrate history ("this
+  used to be…"). That applies to DESIGN.ko.md as much as to the English files: it is written as
+  Korean, not as a word-for-word rendering.
+- Everything that surfaces in CI — commit messages, test spec names — is in English.
+- Code comments record only the constraints the code cannot show. Logs follow the Kubernetes
+  convention: leading capital, no trailing period, past tense.

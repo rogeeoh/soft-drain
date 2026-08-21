@@ -71,14 +71,14 @@ func TestBuildReplacement(t *testing.T) {
 	if pod.Labels[LabelReplaces] != "3f2a-uid" {
 		t.Errorf("replaces label = %q", pod.Labels[LabelReplaces])
 	}
-	// cost가 대체 Pod에 남으면 입양 후 다음 스케일다운마다 그 Pod이 1순위로 죽는다
+	// cost left on a replacement makes that Pod die first in every scale-down after adoption
 	if _, ok := pod.Annotations[AnnotationPodDeletionCost]; ok {
 		t.Error("replacement must not carry pod-deletion-cost")
 	}
 	if len(pod.Spec.Containers) != 1 || pod.Spec.Containers[0].Image != "nginx:1.15" {
 		t.Errorf("spec not copied from rs template: %+v", pod.Spec)
 	}
-	// 원본 템플릿이 오염되면 다음 라운드가 hash 없는 템플릿으로 판정한다
+	// a polluted source template makes the next round decide on a template without the hash
 	if rs.Spec.Template.Labels[LabelPodTemplateHash] != fixtureHash {
 		t.Error("buildReplacement must not mutate rs.Spec.Template")
 	}
@@ -114,10 +114,10 @@ func TestDeploymentHealthy(t *testing.T) {
 	}{
 		{"healthy", func(d *appsv1.Deployment) {}, true},
 		{"stale observedGeneration", func(d *appsv1.Deployment) { d.Status.ObservedGeneration = 2 }, false},
-		// maxUnavailable: 0 롤아웃은 이 항으로만 잡힌다
+		// a maxUnavailable: 0 rollout is caught by this term alone
 		{"rollout in progress", func(d *appsv1.Deployment) { d.Status.Replicas = 3 }, false},
 		{"below desired availability", func(d *appsv1.Deployment) { d.Status.AvailableReplicas = 1 }, false},
-		// >= 경계 — ==로 잘못 조이는 회귀를 잡는다
+		// the >= boundary — catches a regression that wrongly tightens it to ==
 		{"newer observedGeneration", func(d *appsv1.Deployment) { d.Status.ObservedGeneration = 4 }, true},
 		{"more available than desired", func(d *appsv1.Deployment) { d.Status.AvailableReplicas = 3 }, true},
 		{"nil replicas defaults to 1", func(d *appsv1.Deployment) {
@@ -161,7 +161,7 @@ func TestValidReplacement(t *testing.T) {
 				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs", Controller: ptr.To(true),
 			}}
 		}, false},
-		// controller가 아닌 ownerRef는 입양이 아니다 — 판정 기준은 controller ownerRef뿐
+		// a non-controller ownerRef is not adoption — only a controller ownerRef counts
 		{"non-controller ownerRef", func(p *corev1.Pod) {
 			p.OwnerReferences = []metav1.OwnerReference{{
 				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "rs", Controller: ptr.To(false),
@@ -194,7 +194,7 @@ func TestPodReady(t *testing.T) {
 	if !podReady(pod) {
 		t.Error("PodReady=True must be ready")
 	}
-	// 노드가 NotReady로 빠지면 kubelet이 실제로 Unknown을 만든다
+	// when a node goes NotReady the kubelet really does produce Unknown
 	pod.Status.Conditions[1].Status = corev1.ConditionUnknown
 	if podReady(pod) {
 		t.Error("PodReady=Unknown must not be ready")
@@ -289,7 +289,7 @@ func TestMergePatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// nil이 JSON null로 직렬화되어야 merge patch의 키 삭제가 동작한다
+	// nil must serialize to JSON null for the merge patch to delete the key
 	want := `{"metadata":{"labels":{"keep":"v","remove":null}}}`
 	if string(data) != want {
 		t.Errorf("patch = %s, want %s", data, want)
@@ -308,9 +308,9 @@ func TestDrainActive(t *testing.T) {
 		{"no labels", nil, false},
 		{"draining", map[string]string{LabelDrain: "true"}, true},
 		{"in progress", map[string]string{LabelDrain: "true", LabelState: StateInProgress}, true},
-		// Complete 노드는 사람이 리부팅하러 갈 노드라 여전히 막는다
+		// a Complete node is one a human is about to reboot, so it stays banned
 		{"complete", map[string]string{LabelDrain: "true", LabelState: StateComplete}, true},
-		// Cancelled 노드는 uncordon된 보통 노드다
+		// a Cancelled node is an ordinary uncordoned node
 		{"cancelled", map[string]string{LabelDrain: "true", LabelState: StateCancelled}, false},
 		{"wrong label value", map[string]string{LabelDrain: "false"}, false},
 	}
@@ -352,12 +352,12 @@ func TestTemplatesEqualIgnoreHash(t *testing.T) {
 		mutate func(rsTpl *corev1.PodTemplateSpec)
 		want   bool
 	}{
-		// rs 템플릿에는 hash가 붙어 있어도 같은 세대다
+		// the same generation even though the rs template carries the hash
 		{"same generation", func(*corev1.PodTemplateSpec) {}, true},
 		{"image changed", func(tpl *corev1.PodTemplateSpec) {
 			tpl.Spec.Containers[0].Image = "nginx:1.16"
 		}, false},
-		// rollout restart는 템플릿 어노테이션(restartedAt)만 바꾼다
+		// rollout restart changes only the template annotation (restartedAt)
 		{"rollout restart", func(tpl *corev1.PodTemplateSpec) {
 			tpl.Annotations = map[string]string{"kubectl.kubernetes.io/restartedAt": "2026-08-16T00:00:00Z"}
 		}, false},
@@ -373,7 +373,7 @@ func TestTemplatesEqualIgnoreHash(t *testing.T) {
 			if got := templatesEqualIgnoreHash(deployTpl(), rsTpl); got != tt.want {
 				t.Errorf("templatesEqualIgnoreHash = %v, want %v", got, tt.want)
 			}
-			// 비교가 원본을 오염시키면 이후 라운드가 다른 판정을 한다
+			// if the comparison pollutes the source, later rounds decide differently
 			if rsTpl.Labels[LabelPodTemplateHash] != fixtureHash {
 				t.Error("comparison must not mutate its inputs")
 			}

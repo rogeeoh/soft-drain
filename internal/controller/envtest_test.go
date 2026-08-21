@@ -16,10 +16,10 @@ limitations under the License.
 
 package controller
 
-// envtest에는 kube-controller-manager, scheduler, kubelet이 없다.
-// 여기서는 우리 컨트롤러가 API 서버에 쓰는 것만 검증한다 (CLAUDE.md 테스트 3층).
-// - ReplicaSet 입양·삭제·스케줄링은 일어나지 않으므로 오브젝트를 전부 손으로 만든다.
-// - Pod 삭제는 kubelet이 없어 terminating에 머무니 deletionTimestamp로 단언한다.
+// envtest has no kube-controller-manager, scheduler or kubelet.
+// Only what our controller writes to the API server is verified here (CLAUDE.md, the three test layers).
+// - ReplicaSet adoption, deletion and scheduling never happen, so every object is built by hand.
+// - Pod deletion stays terminating without a kubelet, so it is asserted through deletionTimestamp.
 
 import (
 	"context"
@@ -69,8 +69,8 @@ func uniq(prefix string) string {
 
 const testHash = "abc1234"
 
-// conflictOnDelete는 판정과 삭제 사이에 Pod이 변해 preconditions가 거부되는
-// 교차를 흉내 낸다.
+// conflictOnDelete simulates the interleaving where the Pod changes between the
+// decision and the deletion, so the preconditions reject it.
 type conflictOnDelete struct{ client.Client }
 
 func (c *conflictOnDelete) Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error {
@@ -78,7 +78,7 @@ func (c *conflictOnDelete) Delete(ctx context.Context, obj client.Object, opts .
 		fmt.Errorf("the object has been modified"))
 }
 
-// 롤아웃 스펙들이 템플릿을 이 이미지로 바꿔 세대를 밀어낸다
+// the rollout specs push the generation forward by changing the template to this image
 const rolledImage = "nginx:1.16"
 
 type fixture struct {
@@ -108,7 +108,7 @@ func simpleContainer() []corev1.Container {
 	return []corev1.Container{{Name: "app", Image: "nginx:1.15"}}
 }
 
-// createWorkload는 Deployment → ReplicaSet → 타깃 Pod 사슬을 손으로 만든다.
+// createWorkload builds the Deployment → ReplicaSet → target Pod chain by hand.
 func createWorkload(name, nodeName string) (*appsv1.Deployment, *appsv1.ReplicaSet, *corev1.Pod) {
 	appLabels := map[string]string{"app": name}
 	deploy := &appsv1.Deployment{
@@ -173,8 +173,8 @@ func setupFixture() *fixture {
 	}
 }
 
-// createReplacement는 스케줄까지 끝난 대체 Pod을 흉내 낸다. envtest에는
-// 스케줄러가 없어 nodeName을 생성 시점에 박는다.
+// createReplacement simulates a replacement that is already scheduled. envtest has no
+// scheduler, so nodeName is written at creation.
 func createReplacement(f *fixture, nodeName string, ready bool) *corev1.Pod {
 	repl := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -263,7 +263,7 @@ var _ = Describe("NodeReconciler", func() {
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
-		// patch 하나로 hash가 붙고 replaces가 떨어져 소유가 ReplicaSet으로 넘어간다
+		// one patch attaches the hash and removes replaces, passing ownership to the ReplicaSet
 		got := getPod(repl.Name)
 		Expect(got.Labels[LabelPodTemplateHash]).To(Equal(testHash))
 		Expect(got.Labels).NotTo(HaveKey(LabelReplaces))
@@ -273,7 +273,7 @@ var _ = Describe("NodeReconciler", func() {
 		f := setupFixture()
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, true)
-		// 롤아웃 중: replicas != updatedReplicas
+		// mid-rollout: replicas != updatedReplicas
 		fresh := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
 		fresh.Status = appsv1.DeploymentStatus{
@@ -306,7 +306,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
 		Expect(f.rec.has("ReplacementOnDrainingNode")).To(BeTrue())
 
-		// terminating은 있는 것으로 세지 않으므로 지운 라운드가 바로 새로 만든다
+		// terminating does not count as existing, so the round that deleted it creates a new one at once
 		var live int
 		for _, p := range listReplacements(f.target.UID) {
 			if p.DeletionTimestamp == nil {
@@ -321,12 +321,12 @@ var _ = Describe("NodeReconciler", func() {
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, false)
 
-		// 앉은 노드가 멀쩡하면 Ready를 기다린다
+		// if the node it landed on is fine, wait for Ready
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getPod(repl.Name).DeletionTimestamp).To(BeNil())
 
-		// 그 노드에 drain이 걸리면 Ready를 기다릴 이유가 없다
+		// once that node is draining there is no reason to wait for Ready
 		patch := mergePatch(map[string]any{
 			"metadata": map[string]any{"labels": map[string]any{LabelDrain: "true"}},
 		})
@@ -343,7 +343,7 @@ var _ = Describe("NodeReconciler", func() {
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, false)
 
-		// 이미지가 바뀌면 타깃의 RS는 현재 세대가 아니다
+		// with the image changed the target's RS is not the current generation
 		fresh := &appsv1.Deployment{}
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
 		fresh.Spec.Template.Spec.Containers[0].Image = rolledImage
@@ -354,7 +354,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getPod(repl.Name).DeletionTimestamp).NotTo(BeNil())
 		Expect(f.rec.has("ReplacementSuperseded")).To(BeTrue())
 
-		// stale한 동안은 다시 만들지 않는다 — 이주는 롤아웃의 몫이다
+		// while stale, nothing is created again — the migration belongs to the rollout
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 		var live int
@@ -365,7 +365,7 @@ var _ = Describe("NodeReconciler", func() {
 		}
 		Expect(live).To(Equal(0))
 
-		// 세대가 돌아오면 재개된다
+		// it resumes once the generation comes back
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
 		fresh.Spec.Template.Spec.Containers[0].Image = "nginx:1.15"
 		Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
@@ -394,7 +394,7 @@ var _ = Describe("NodeReconciler", func() {
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
-		// paused면 롤아웃이 실제로 움직이지 않는다 — 대체는 평소처럼 유지된다
+		// paused means the rollout does not actually move — replacements are maintained as usual
 		Expect(getPod(repl.Name).DeletionTimestamp).To(BeNil())
 		Expect(f.rec.has("ReplacementSuperseded")).To(BeFalse())
 	})
@@ -408,7 +408,7 @@ var _ = Describe("NodeReconciler", func() {
 		res, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
-		// 삭제가 거부된 낡은 명단이 넘기기로 흘러가지 않는다 — 라운드를 접고 재판정한다
+		// a stale list whose deletion was rejected never reaches hand-over — the round ends and decides again
 		got := getPod(repl.Name)
 		Expect(got.DeletionTimestamp).To(BeNil())
 		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
@@ -429,8 +429,8 @@ var _ = Describe("NodeReconciler", func() {
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
-		// Ready였어도 입양이 아니라 삭제다 — Healthy(D)가 롤아웃 내내 넘기기를 막으므로
-		// 이 대체는 입양에 도달할 수 없는 Pod이다
+		// deletion, not adoption, even if it was Ready — Healthy(D) blocks hand-over for the
+		// whole rollout, so this replacement can never reach adoption
 		got := getPod(repl.Name)
 		Expect(got.DeletionTimestamp).NotTo(BeNil())
 		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
@@ -442,10 +442,10 @@ var _ = Describe("NodeReconciler", func() {
 		other := createNode(uniq("other-node"), nil)
 		repl := createReplacement(f, other.Name, true)
 
-		// 삭제자(PodReconciler)가 읽어둔 시점의 복사본
+		// the copy as the deleter (PodReconciler) read it
 		stale := repl.DeepCopy()
 
-		// 그 사이 넘기기가 patch 하나로 hash를 붙이고 replaces를 뗀다
+		// meanwhile the hand-over attaches the hash and removes replaces in one patch
 		patch := mergePatch(map[string]any{
 			"metadata": map[string]any{"labels": map[string]any{
 				LabelPodTemplateHash: testHash,
@@ -454,7 +454,7 @@ var _ = Describe("NodeReconciler", func() {
 		})
 		Expect(k8sClient.Patch(ctx, repl, patch)).To(Succeed())
 
-		// stale 복사본으로 삭제 시도 — resourceVersion precondition이 거부한다
+		// deleting with the stale copy — the resourceVersion precondition rejects it
 		deleted, err := deleteReplacement(ctx, k8sClient, stale)
 		Expect(err).NotTo(HaveOccurred())
 		Expect(deleted).To(BeFalse())
@@ -467,15 +467,15 @@ var _ = Describe("NodeReconciler", func() {
 		repl := createReplacement(f, other.Name, true)
 		setDeployHealthy(f.deploy)
 
-		// 1라운드: 넘기기까지 간다
+		// round 1: goes through hand-over
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 		handed := getPod(repl.Name)
 		Expect(handed.Labels[LabelPodTemplateHash]).To(Equal(testHash))
 
-		// envtest에는 RS 컨트롤러가 없어 타깃이 지워지지 않는다 — 넘기는 순간
-		// replicas가 올라 초과분이 증설분에 흡수된 것과 같은 상태다.
-		// 2라운드: "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
+		// envtest has no RS controller, so the target is not deleted — the same state as
+		// replicas going up at the moment of hand-over and the surplus being absorbed.
+		// round 2: sees "the target is still there and nothing stands in for it" and creates one more.
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
@@ -487,7 +487,7 @@ var _ = Describe("NodeReconciler", func() {
 		}
 		Expect(live).To(HaveLen(1))
 		Expect(live[0].Name).NotTo(Equal(repl.Name))
-		// 넘긴 Pod은 건드리지 않았다
+		// the handed-over Pod was left untouched
 		Expect(getPod(repl.Name).Labels).NotTo(HaveKey(LabelReplaces))
 	})
 
@@ -502,7 +502,7 @@ var _ = Describe("NodeReconciler", func() {
 		got := getNode(node.Name)
 		Expect(got.Spec.Unschedulable).To(BeTrue())
 		Expect(got.Labels[LabelState]).To(Equal(StateComplete))
-		// cordon은 여전히 우리 것 — 어노테이션은 라벨이 걷힐 때 함께 걷힌다
+		// the cordon is still ours — the annotation comes off when the label does
 		Expect(got.Annotations).To(HaveKeyWithValue(AnnotationCordoned, "true"))
 		Expect(rec.has("DrainComplete")).To(BeTrue())
 	})
@@ -512,7 +512,7 @@ var _ = Describe("NodeReconciler", func() {
 		r := &NodeReconciler{Client: k8sClient, Reader: k8sClient, Recorder: rec}
 		node := createNode(uniq("done-node"), map[string]string{LabelDrain: "true"})
 
-		// 빈 노드라 첫 라운드에 cordon과 Complete까지 간다
+		// an empty node reaches cordon and Complete in the first round
 		_, err := r.Reconcile(ctx, nodeReq(node))
 		Expect(err).NotTo(HaveOccurred())
 		got := getNode(node.Name)
@@ -536,7 +536,7 @@ var _ = Describe("NodeReconciler", func() {
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
-		// 사람이 uncordon — Cancelled로 접히며 어노테이션이 지워진다
+		// a human uncordons — it folds into Cancelled and the annotation is deleted
 		node := getNode(f.node.Name)
 		node.Spec.Unschedulable = false
 		Expect(k8sClient.Update(ctx, node)).To(Succeed())
@@ -544,7 +544,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateCancelled))
 
-		// 사람이 다른 이유로 다시 cordon한 뒤 라벨을 걷는다
+		// a human re-cordons for another reason, then the label is removed
 		node = getNode(f.node.Name)
 		node.Spec.Unschedulable = true
 		Expect(k8sClient.Update(ctx, node)).To(Succeed())
@@ -556,7 +556,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(err).NotTo(HaveOccurred())
 
 		got := getNode(f.node.Name)
-		// 우리 기록이 아닌 cordon은 걷지 않는다
+		// a cordon that is not our record is not lifted
 		Expect(got.Spec.Unschedulable).To(BeTrue())
 		Expect(got.Labels).NotTo(HaveKey(LabelState))
 		Expect(got.Annotations).NotTo(HaveKey(AnnotationCordoned))
@@ -564,13 +564,13 @@ var _ = Describe("NodeReconciler", func() {
 
 	It("Complete latches: later targets are left alone", func() {
 		f := setupFixture()
-		// Complete 상태를 만든다: 타깃을 먼저 지우고(0 grace로 즉시) reconcile
+		// reach Complete: delete the target first (0 grace, immediate) and reconcile
 		Expect(k8sClient.Delete(ctx, f.target, client.GracePeriodSeconds(0))).To(Succeed())
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateComplete))
 
-		// tolerate 워크로드가 뒤늦게 앉은 상황
+		// a tolerating workload seated late
 		_, _, late := createWorkload(uniq("late"), f.node.Name)
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
@@ -585,7 +585,7 @@ var _ = Describe("NodeReconciler", func() {
 		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
-		// 사람이 uncordon
+		// a human uncordons
 		node := getNode(f.node.Name)
 		node.Spec.Unschedulable = false
 		Expect(k8sClient.Update(ctx, node)).To(Succeed())
@@ -600,7 +600,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getPod(f.target.Name).Annotations).NotTo(HaveKey(AnnotationPodDeletionCost))
 		Expect(f.rec.has("DrainCancelled")).To(BeTrue())
 
-		// 래치: 다시 돌려도 cordon하지 않는다
+		// latch: another round does not cordon again
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getNode(f.node.Name).Spec.Unschedulable).To(BeFalse())
@@ -613,7 +613,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateComplete))
 
-		// 사람이 우리 cordon을 풀고 노드를 다시 쓰기로 함
+		// a human lifts our cordon and decides to use the node again
 		node := getNode(f.node.Name)
 		node.Spec.Unschedulable = false
 		Expect(k8sClient.Update(ctx, node)).To(Succeed())
@@ -626,10 +626,10 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(got.Spec.Unschedulable).To(BeFalse())
 		Expect(f.rec.has("DrainCancelled")).To(BeTrue())
 
-		// Cancelled로 접혔으므로 착지 검사도 이 노드를 막지 않는다
+		// folded into Cancelled, so the landing check does not block this node either
 		Expect(drainActive(got)).To(BeFalse())
 
-		// 래치: 다시 돌려도 cordon하지 않는다
+		// latch: another round does not cordon again
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 		Expect(getNode(f.node.Name).Spec.Unschedulable).To(BeFalse())
@@ -690,7 +690,7 @@ var _ = Describe("PodReconciler", func() {
 
 		_, err := newReconciler().Reconcile(ctx, podReq(repl))
 		Expect(err).NotTo(HaveOccurred())
-		// 스케줄 전 Pod은 kubelet 확인이 필요 없어 즉시 사라진다
+		// an unscheduled Pod needs no kubelet confirmation, so it disappears immediately
 		gone := k8sClient.Get(ctx, types.NamespacedName{Namespace: "default", Name: repl.Name}, &corev1.Pod{})
 		Expect(apierrors.IsNotFound(gone)).To(BeTrue())
 	})

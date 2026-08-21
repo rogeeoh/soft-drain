@@ -1,152 +1,277 @@
 # soft-drain
 
-## 왜 만드는가
+> Korean translation: [DESIGN.ko.md](DESIGN.ko.md). This file is normative.
 
-노드를 빼려면 `kubectl drain`을 쓰는데, replicas가 1인 워크로드는 Pod이 먼저 죽고 새로 뜨는 동안 장애가 난다. 2벌을 띄워 HA를 만들자니 비용이 두 배고, PDB를 걸면 drain이 429로 튕길 뿐 Pod이 옮겨지지는 않는다.
+## Why
 
-soft-drain은 **새 Pod을 먼저 띄우고 Ready가 된 다음 옛 Pod을 없앤다.** 용량이 비는 순간이 없다.
+Taking a node out means `kubectl drain`, and a workload with one replica goes down while it
+runs: the Pod is killed first, and the new one only starts after. Running a second copy for
+HA doubles the bill, and a PDB only makes the drain bounce with 429s — the Pod still does not
+move.
 
-## 원리
+soft-drain **brings the new Pod up, waits for it to be Ready, and only then lets the old one
+go.** There is no moment where capacity is missing.
 
-ReplicaSet에는 두 가지 성질이 있다.
+## How it works
 
-1. selector에 맞고 주인 없는 Pod을 보면 자기 자식으로 데려간다.
-2. 자식이 replicas보다 많으면 하나를 지우는데, `pod-deletion-cost`가 낮은 쪽을 먼저 지운다.
+A ReplicaSet has two properties.
 
-soft-drain은 이 둘을 이어 붙인다. 옮길 Pod과 똑같은 Pod을 하나 더 만들되 `pod-template-hash` 라벨은 빼둔다. 그러면 selector에 안 걸려서 ReplicaSet이 데려가지 않는다. 그 Pod이 Ready가 되면 hash를 붙인다. ReplicaSet이 데려가면서 자식이 하나 늘고, 늘어난 만큼 하나를 지운다. `pod-deletion-cost`가 음수인 옛 Pod이 지워진다.
+1. It adopts an ownerless Pod that matches its selector.
+2. When it has more children than `replicas`, it deletes one — the lowest `pod-deletion-cost`
+   first.
 
-**Pod을 옮기는 일은 ReplicaSet이 한다. soft-drain은 재료만 놓아준다.**
+soft-drain chains the two. It creates a second Pod identical to the one to be moved, but
+without the `pod-template-hash` label. Without the hash the Pod does not match the selector,
+so the ReplicaSet leaves it alone. Once that Pod is Ready, the hash is added. The ReplicaSet
+adopts it, is now one child over `replicas`, and deletes one: the old Pod, whose
+`pod-deletion-cost` is negative.
 
-`pod-template-hash`를 처음부터 붙이면 안 된다. ReplicaSet이 만들자마자 데려가는데 그때 새 Pod은 아직 Pending이고, 삭제 순서에서 Pending과 NotReady가 `pod-deletion-cost`보다 앞이라 방금 만든 Pod이 먼저 죽는다.
+**The ReplicaSet is what moves the Pod. soft-drain only lays out the materials.**
 
-`pod-template-hash`는 ReplicaSet selector에는 들어가고 Service selector에는 안 들어간다. 그래서 대체 Pod은 Ready가 되는 즉시 Endpoints에 올라가고 입양 전후로 빠지지 않는다. 엔드포인트 갱신이 Pod당 한 번뿐이다.
+The hash must not be there from the start. The ReplicaSet would adopt the new Pod the moment
+it appears, while it is still Pending — and Pending and NotReady rank ahead of
+`pod-deletion-cost` in the deletion order, so the Pod just created would be the first to die.
 
-**보장하는 것은 노출이지 어느 Pod이 지워지는가가 아니다.** `pod-deletion-cost`는 삭제 정렬의 4순위 힌트다. 넘기는 순간 무관한 Pod이 NotReady면 ReplicaSet은 그쪽을 지우고 우리 타깃은 남는다. 그래도 Ready인 Pod을 먼저 늘린 다음 초과분이 지워지므로 노출은 `N` 밑으로 내려가지 않고, 남은 타깃은 다음 라운드에 다시 시도된다.
+`pod-template-hash` belongs to the ReplicaSet selector, not to the Service selector. A
+replacement therefore enters Endpoints as soon as it is Ready and never drops out across
+adoption. One endpoint update per Pod, no more.
 
-## 쓰는 법
+**What is guaranteed is exposure, not which Pod gets deleted.** `pod-deletion-cost` is the
+fourth-ranked hint in the deletion ordering. If an unrelated Pod is NotReady at the moment of
+hand-over, the ReplicaSet deletes that one and our target survives. Exposure still never falls
+below `N`, because a Ready Pod is added before the surplus is removed, and the surviving target
+is tried again in the next round.
 
-```
-kubectl label node node-01 soft-drain.com/drain=true      # 시작
-kubectl get nodes -l soft-drain.com/state=Complete        # 완료 확인
-kubectl label node node-01 soft-drain.com/drain-          # 취소
-kubectl uncordon node-01                                 # 이것도 취소다 (state=Cancelled 로 남는다)
-```
-
-끝난 노드는 cordon된 채로 남는다. 그 다음에 drain을 하든 노드를 리부팅하든 soft-drain이 상관할 일이 아니다. 정비가 끝나 drain 라벨을 걷으면 우리가 걸었던 cordon도 함께 걷힌다 — 라벨 제거가 곧 노드 반환이다. 사람이 미리 걸어둔 cordon이면 그대로 둔다.
-
-### kubectl 플러그인
-
-`kubectl soft-drain`은 위 네 줄의 포장이다. **쓰는 것은 drain 라벨 하나뿐이고 나머지는 읽기다** — 서버 쪽 표면은 늘지 않는다. 문법은 `git stash`형이다 — 맨몸+노드가 주 동작이고, 나머지는 서브커맨드다. `status`, `release`, `version`은 예약어다.
-
-```
-kubectl soft-drain node-01 [node-02 ...]   # 라벨을 붙이고 전부 Complete될 때까지 진행을 보여준다 (--wait=false, --timeout)
-kubectl soft-drain status                  # 현황판: 관여 중인 노드·남은 타깃·대체 Pod
-kubectl soft-drain status node-01 -o json  # 특정 노드, 기계용 (json|yaml)
-kubectl soft-drain release node-01 [...]   # 라벨을 걷고 복원을 기다린다
-```
-
-release는 진행 중이면 취소가 되고 Complete면 관리 종료가 된다 — 실체는 같은 라벨 제거고, 결말도 같다: 우리가 남긴 것을 전부 걷는다(우리가 걸었던 cordon 포함). 그래서 release는 정비가 끝난 뒤의 동사다 — 리부팅 전에 하면 비워 둔 노드가 도로 열린다. `kubectl uncordon`도 취소지만 라벨과 Cancelled 래치가 남는 점이 다르다 — release는 전부 걷는다. `--timeout`이 터지면 Pending 대체 Pod과 스케줄러 메시지를 보여주고 0이 아닌 코드로 나간다 — "막혔을 때 보는 법"의 자동화다. 중간에 끊어도 라벨은 남으므로 drain은 계속된다. `state=Cancelled`인 노드에 다시 drain을 걸면 라벨을 걷어 복원시킨 뒤 다시 붙인다.
-
-현황판에 "언제부터"는 없다 — 컨트롤러가 무기억이라 시작 시각을 어디에도 기록하지 않는다. `-o`의 몫은 플러그인만 계산할 수 있는 집계(타깃·대체 Pod 상태·스케줄러 메시지)다. 노드명 목록이 필요한 기계는 라벨 조회가 정석이다: `kubectl get nodes -l soft-drain.com/state=Complete -o name`.
-
-`kubectl drain`의 `--ignore-daemonsets`, `--delete-emptydir-data`, `--force`는 없다. eviction 전제의 개념이라 여기 해당이 없다.
-
-## 컨트롤러가 하는 일
+## Usage
 
 ```
-1. drain 라벨이 붙은 노드를 cordon한다
-2. 그 노드의 Deployment Pod(타깃)에 pod-deletion-cost 를 음수로 박는다
-3. 타깃마다 대체 Pod이 하나씩 있도록 맞춘다
-4. 대체 Pod이 Ready가 되면 pod-template-hash 를 붙여 ReplicaSet이 데려가게 한다
-5. 타깃이 없어질 때까지 반복한다
-6. 타깃이 없으면 완료 표시를 한다
+kubectl label node node-01 soft-drain.com/drain=true      # start
+kubectl get nodes -l soft-drain.com/state=Complete        # check for completion
+kubectl label node node-01 soft-drain.com/drain-          # cancel
+kubectl uncordon node-01                                 # also a cancel (leaves state=Cancelled)
 ```
 
-**어떤 상태도 기억하지 않는다.** 매번 클러스터를 다시 보고 전부 다시 판정하므로 중간에 죽어도 다음 라운드가 이어서 한다.
+A finished node stays cordoned. What happens next — draining it, rebooting it — is not
+soft-drain's business. When maintenance is over and the drain label comes off, the cordon we
+placed comes off with it: removing the label is how the node is handed back. A cordon a human
+placed beforehand is left alone.
 
-**읽기는 API 서버에서 직접 한다.** watch는 다시 볼 때를 알려주는 데만 쓴다. 캐시가 뒤처진 상태를 설계가 감당하기 시작하면 조건이 급격히 복잡해진다. 부하가 문제가 되면 그때 캐시를 붙인다.
+### The kubectl plugin
 
-### 1. 노드 마킹
-
-`drain` 라벨이 있으면 cordon한다. 우리가 실제로 값을 바꿨을 때만 `cordoned-by-controller` 어노테이션을 단다. 사람이 미리 걸어둔 cordon을 나중에 우리가 푸는 일을 막기 위해서다.
-
-**cordon은 준비 작업이 아니라 이 반복이 끝나는 이유다.** cordon을 걸어두면 그 노드에는 Pod이 새로 안 뜬다. 빼야 할 Pod이 늘어날 일이 없으니 하나씩 빼다 보면 언젠가 바닥이 난다. 예외는 `unschedulable`을 tolerate하는 워크로드뿐인데, 그건 빼도 그 자리에 다시 앉아서 줄지를 않는다. 그래서 거기서 멈춘다(4번).
-
-`drain` 라벨이 사라지면 되돌린다 — 우리 값이 박힌 `pod-deletion-cost`를 걷고, `cordoned-by-controller`가 있으면 uncordon하고, `state` 라벨을 지운다.
-
-**누가 uncordon하면 관여를 접는다 — 진행 중이든 끝난 뒤든.** `state`가 `InProgress`나 `Complete`인데 노드가 `unschedulable`이 아니면 그렇게 된 것이다 — 두 상태 모두 cordon을 확인한 뒤에만 붙기 때문에 이 조합이 곧 증거다. 진행 중이라면 cordon은 종료를 보장하던 전제라서 전제가 사라진 채 계속할 수 없고, 끝난 뒤라면 사람이 우리 cordon을 풀고 노드를 다시 쓰기로 결정한 것이다. 어느 쪽이든 다시 cordon해서 사람과 싸우지 않는다. cost를 걷고 `cordoned-by-controller`를 지우고 `state=Cancelled`를 붙인 뒤 손을 뗀다. 어노테이션을 지우는 이유: 기록된 cordon은 사람 손에 이미 풀렸으므로, 이후 사람이 새로 건 cordon을 라벨 제거 시점의 복원이 우리 것으로 오인해 풀면 안 된다. 대체 Pod은 회수 경로가 걷는다. `Cancelled`는 래치다 — 라벨을 걷으면 지워지고, 다시 하려면 라벨을 걷었다가 다시 붙인다.
-
-`Complete`를 접지 않고 두면 그 노드가 삭제 자석이 된다. 방금 비워져 가장 한가한 노드가 열렸으니 스케줄러는 다른 drain의 대체 Pod을 정확히 거기 앉히고, 착지 검사는 앉는 족족 지운다. 클러스터가 작을수록 모든 drain이 그 노드로 빨려 들어간다.
-
-### 2. 타깃 표시
-
-타깃은 **그 노드 위에서 owner가 ReplicaSet이고 그 ReplicaSet의 owner가 Deployment인 Pod**이다. phase가 `Failed`나 `Succeeded`인 Pod은 빼고 센다 — ReplicaSet도 active로 세지 않는 Pod이라 대체는 이미 딴 곳에 만들어져 있고, 노드에 남은 시체가 완료 판정만 막는다.
-
-`controller.kubernetes.io/pod-deletion-cost = -2147483648`을 쓴다. 타깃에만 쓰고, 시점은 대체 Pod을 만들기 전이다 — 넘기기까지 미룰 이유가 없고, 그 사이 무관한 스케일다운이 나도 드레인 대상이 먼저 죽는 쪽이 낫다.
-
-대체 Pod에는 쓰지 않는다. 입양 전에는 ReplicaSet이 쳐다보지 않는 Pod이라 값이 무의미하고, 입양 후에 남으면 그 Pod이 다음 스케일다운마다 1순위로 죽는다. 타깃은 지워지면서 값도 같이 사라지므로 걷을 것이 없다.
-
-원래 값이 있었어도 덮어쓰고 복원하지 않는다. 되돌릴 때는 값이 정확히 `-2147483648`인 것만 지운다. 그 값을 쓰는 게 우리뿐이라 값이 이것이면 우리가 붙인 것이다.
-
-### 3. 대체 Pod 맞추기
-
-만들기만 하는 단계가 아니다. **있어야 할 집합과 있는 집합을 맞춘다.**
+`kubectl soft-drain` wraps the four lines above. **The only thing it writes is the drain label;
+everything else is a read** — the server-side surface does not grow. The grammar follows
+`git stash`: bare invocation plus nodes is the main verb, the rest are subcommands. `status`,
+`release` and `version` are reserved words.
 
 ```
-있어야 할 것 = deletionTimestamp 가 없는 타깃마다 하나
-있는 것      = soft-drain.com/replaces = <타깃 UID> 이면서
-               controller ownerRef 없고
-               phase 가 Failed / Succeeded 가 아니고
-               deletionTimestamp 도 없는 Pod
-
-모자라면 만들고, 남으면 지운다
+kubectl soft-drain node-01 [node-02 ...]   # labels, then shows progress until all are Complete (--wait=false, --timeout)
+kubectl soft-drain status                  # dashboard: managed nodes, remaining targets, replacements
+kubectl soft-drain status node-01 -o json  # one node, for machines (json|yaml)
+kubectl soft-drain release node-01 [...]   # removes the label and waits for the restore
 ```
 
-**타깃이 사라지면 대체 Pod도 사라진다.** 취소, 롤아웃으로 인한 ReplicaSet prune, Deployment 삭제, `replicas` 축소, 타깃의 eviction이 전부 이 한 줄에 걸린다. 따로 처리할 것이 없다.
+`release` cancels a drain in progress and ends management of a Complete one — the same label
+removal underneath, with the same ending: everything we left behind is taken back, including
+the cordon we placed. That makes `release` the verb for after maintenance; run it before the
+reboot and the node you just emptied opens up again. `kubectl uncordon` also cancels, but
+leaves the label and the `Cancelled` latch behind — `release` takes back all of it. On
+`--timeout` it prints the Pending replacements and the scheduler's message and exits non-zero:
+the automation of "reading a stuck node" below. Interrupting it changes nothing, since the
+label stays and the drain continues. Draining a node that is `state=Cancelled` removes the
+label to restore it first, then puts it back.
 
-**terminating 타깃은 만들기에서 뺀다.** ReplicaSet은 `deletionTimestamp`가 찍힌 Pod을 active에서 빼므로 이미 스스로 대체를 만들고 있고, 노드가 cordon이라 그 Pod은 다른 노드에 뜬다. 자리는 우리가 아무것도 안 해도 비워진다.
+The dashboard has no "since when" — the controller is memoryless and records the start time
+nowhere. What `-o` is for is the aggregation only the plugin can compute: targets, replacement
+status, scheduler messages. A machine that needs a list of node names should query labels, as
+usual: `kubectl get nodes -l soft-drain.com/state=Complete -o name`.
 
-**죽은 대체 Pod은 있는 것으로 세지 않고, 지운다.** 노드 압력 eviction이나 kubelet admission 거부로 `Failed`가 된 Pod은 Ready가 될 수도 입양될 수도 없다. 살아 있는 것으로 세면 그 타깃이 영원히 멈춘다. Pod에는 재시작이 없어서(phase `Failed`는 터미널이고 `restartPolicy`는 컨테이너 얘기다) 복구는 새 Pod뿐인데, 세지 않고 지우지도 않으면 만들 때마다 시체가 쌓인다. 원인이 지속되면 만들고-죽고-지우기를 반복하다가 원인이 풀리는 순간 수렴한다.
+There is no `--ignore-daemonsets`, `--delete-emptydir-data` or `--force`. Those are concepts
+that presuppose eviction, and none applies here.
 
-**drain 중인 노드에 앉은 대체 Pod도 세지 않고, 지운다.** cordon보다 스케줄이 먼저여서, 앉은 뒤에 그 노드에 drain이 걸리는 경우가 생긴다. Ready를 기다릴 이유가 없다 — Ready가 되어도 넘기면 비우려는 노드에 타깃이 하나 더 생길 뿐이라 결말은 삭제뿐이고, 그동안 자리만 먹는다. hash가 없어 어느 ReplicaSet의 자식도 아니므로 지워도 노출은 줄지 않고, 같은 라운드가 새로 만들면 스케줄러가 cordon을 피해 앉힌다. 지울 때 Warning Event를 남긴다.
+## What the controller does
 
-`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 새로 만든 Pod이 또 drain 노드에 앉을 수 있고, 그러면 만들고 지우기를 반복한다. cordon을 무시하도록 만든 워크로드이므로 우리가 `nodeAffinity`를 주입해 그 의도를 뒤집지 않는다. 반복되는 Warning Event가 옮길 수 없다는 사실을 보여준다.
+```
+1. cordon the node carrying the drain label
+2. write a negative pod-deletion-cost on that node's Deployment Pods (the targets)
+3. keep one replacement Pod per target
+4. once a replacement is Ready, attach pod-template-hash so the ReplicaSet takes it
+5. repeat until no targets are left
+6. with no targets left, mark it complete
+```
 
-**타깃의 ReplicaSet이 Deployment의 현재 템플릿이 아니면 만들지 않고, 있으면 지운다.** 롤아웃이 그 타깃을 이미 대체하는 중이다 — 새 버전을 다른 노드에 올리고 Ready 후 타깃을 지우는, 우리가 하려던 일 그대로다. 우리 대체 Pod은 낙선한 버전을 짓는 잉여이고, Healthy(D)가 롤아웃 내내 넘기기를 막으므로 입양에 도달할 수도 없다. `pod-deletion-cost`는 타깃에 남아 있으므로 old ReplicaSet의 스케일다운이 drain 노드의 타깃부터 지운다. 지울 때 Normal Event를 남긴다. 판정은 Deployment의 `spec.template`과 타깃 ReplicaSet의 템플릿을 `pod-template-hash` 라벨만 빼고 비교한다(Deployment 컨트롤러의 EqualIgnoreHash와 같다) — 이미지 변경이든 `rollout restart`든, 템플릿이 바뀌는 모든 경우가 같은 길로 잡힌다. 단 `spec.paused`면 템플릿이 달라도 이 규칙을 적용하지 않는다 — 롤아웃이 실제로 움직이지 않아 "대체 중"이라는 전제가 깨진다. 대체는 평소처럼 유지되고 넘기기만 Healthy(D)에 걸려 미뤄지다가, 재개되는 순간 이 규칙이 잡는다.
+**No state is remembered.** Every round re-reads the cluster and re-derives everything, so a
+controller that dies mid-way is simply continued by the next round.
 
-**두 삭제가 preconditions에 거부되면 라운드를 접는다.** 거부는 판정과 삭제 사이에 Pod이 변했다는 뜻이다. 낡은 명단으로 넘기기까지 진행하지 않고 짧은 requeue로 라운드를 끝내, 다음 라운드가 새 상태에서 처음부터 판정한다. 그래서 넘기기는 "drain 중인 노드에 앉은 대체"를 다시 검사할 필요가 없다.
+**Reads go straight to the API server.** Watches are used only to know when to look again. Once
+the design starts absorbing stale-cache states the conditions get complicated fast. If load
+ever becomes the problem, a cache can be added then.
 
-**이미 넘긴 것도 세지 않는다.** 넘기면서 `soft-drain.com/replaces` 라벨을 떼기 때문에 애초에 후보가 아니다. 그래서 넘겼는데 타깃이 살아남은 경우가 자연히 복구된다 — 넘기는 순간 `replicas`가 올라가면 초과분이 증설분에 흡수되어 아무것도 안 지워지는데, 다음 라운드가 "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
+### Step 1. Marking the node
 
-**만드는 쪽과 지우는 쪽 양쪽에서 깨어나야 한다.** 노드에서 출발하는 순회만 있으면, ReplicaSet이 prune될 때 타깃 Pod도 같이 사라져서 순회할 대상이 없어지고 대체 Pod을 쳐다볼 일이 없어진다. 그래서 대체 Pod 자체를 키로 하는 경로가 따로 있어야 한다. 판정은 위 한 줄로 같다.
+A node with the `drain` label gets cordoned. The `cordoned-by-controller` annotation is written
+only when we actually changed the value. That is what stops us from later lifting a cordon a
+human placed beforehand.
 
-대체 Pod은 이렇게 만든다.
+**The cordon is not preparation; it is the reason this loop terminates.** A cordoned node takes
+no new Pods. The set of Pods to remove cannot grow, so removing them one at a time eventually
+empties it. The one exception is a workload that tolerates `unschedulable`: removing such a Pod
+just seats another one in the same place and the count never falls. That is where it stops
+(step 3).
+
+When the `drain` label disappears, everything is reverted — the `pod-deletion-cost` values we
+wrote are removed, the node is uncordoned if `cordoned-by-controller` is present, and the
+`state` label is deleted.
+
+**If someone uncordons the node, we let go — mid-drain or after.** A node whose `state` is
+`InProgress` or `Complete` but which is no longer `unschedulable` got there that way: both
+states are only ever set after confirming the cordon, so the combination is the evidence.
+Mid-drain, the cordon was the premise that guaranteed termination, and we cannot continue
+without it; after completion, a human has lifted our cordon and decided to use the node again.
+Either way we do not re-cordon and fight them. The costs are removed, `cordoned-by-controller`
+is deleted, `state=Cancelled` is set, and we stop. The annotation goes because the cordon it
+recorded is already gone by a human's hand: a cordon they place later must not be mistaken for
+ours and lifted by the restore that runs on label removal. Replacement Pods are collected by
+the reclamation path. `Cancelled` is a latch — removing the label clears it, and starting over
+means removing the label and adding it again.
+
+Leaving `Complete` unfinished turns the node into a deletion magnet. The node with the most
+room, just emptied, is now open, so the scheduler seats another drain's replacements exactly
+there, and the landing check deletes them as fast as they arrive. The smaller the cluster, the
+more every drain is pulled into that one node.
+
+### Step 2. Marking targets
+
+A target is **a Pod on that node whose owner is a ReplicaSet whose owner is a Deployment**.
+Pods in phase `Failed` or `Succeeded` are not counted — the ReplicaSet does not count them as
+active either, so their replacements already exist elsewhere, and the corpses left on the node
+would only block the completion check.
+
+The annotation used is `controller.kubernetes.io/pod-deletion-cost = -2147483648`. It is
+written on targets only, and it is written before the replacement is created: there is no
+reason to wait until hand-over, and if an unrelated scale-down happens in between, the drained
+node's Pods are the better ones to lose.
+
+It is not written on replacements. Before adoption the ReplicaSet does not look at that Pod, so
+the value means nothing; if it survives adoption, that Pod becomes the first to die in every
+later scale-down. Targets carry the value away with them when they are deleted, so there is
+nothing to clean up.
+
+An existing value is overwritten and not restored. On revert, only values that are exactly
+`-2147483648` are removed. Nothing else writes that value, so a value of exactly that is one of
+ours.
+
+### Step 3. Matching replacements
+
+This step does not only create. **It reconciles the set that should exist against the set that
+does.**
+
+```
+should exist = one per target without a deletionTimestamp
+does exist   = Pods with soft-drain.com/replaces = <target UID>
+               that have no controller ownerRef,
+               are not in phase Failed / Succeeded,
+               and have no deletionTimestamp
+
+too few, create; too many, delete
+```
+
+**When a target goes away, so does its replacement.** Cancellation, a ReplicaSet pruned by a
+rollout, a deleted Deployment, a lowered `replicas`, an evicted target — all of it is covered
+by that single line. Nothing needs handling on its own.
+
+**Terminating targets are excluded from creation.** A ReplicaSet drops Pods with a
+`deletionTimestamp` from its active count, so it is already making its own replacement, and
+since the node is cordoned that Pod lands elsewhere. The slot is freed without us doing
+anything.
+
+**Dead replacements are not counted, and are deleted.** A Pod that went `Failed` through node
+pressure eviction or a kubelet admission rejection can neither become Ready nor be adopted.
+Counting it as alive stalls that target forever. There is no restart for a Pod — phase `Failed`
+is terminal and `restartPolicy` is about containers — so recovery means a new Pod; and if the
+dead one is neither counted nor deleted, corpses pile up with every attempt. While the cause
+persists this cycles through create-die-delete, and it converges the moment the cause clears.
+
+**Replacements seated on a draining node are not counted either, and are deleted.**
+Scheduling can precede the cordon, so a Pod can land on a node that only afterwards gets the
+drain label. There is no reason to wait for Ready: even Ready, handing it over would just add
+one more target to the node we are emptying, so deletion is the only ending, and meanwhile it
+occupies a slot. It has no hash, so it is no ReplicaSet's child, and deleting it does not lower
+exposure; the same round creates a new one and the scheduler seats it away from the cordon. A
+Warning Event is emitted on deletion.
+
+A workload that tolerates `node.kubernetes.io/unschedulable` may have its new Pod land on a
+draining node again, and then create-and-delete repeats. It is a workload built to ignore
+cordons, so we do not invert that intent by injecting `nodeAffinity`. The repeating Warning
+Events are what show that it cannot be moved.
+
+**If the target's ReplicaSet is not the Deployment's current template, nothing is created, and
+anything present is deleted.** A rollout is already replacing that target — bringing the new
+version up on another node and deleting the target once it is Ready, which is exactly what we
+were about to do. Our replacement would build the losing version for nothing, and Healthy(D)
+blocks hand-over for the whole rollout, so it could never reach adoption anyway.
+`pod-deletion-cost` stays on the target, so the old ReplicaSet's scale-down deletes the drained
+node's targets first. A Normal Event is emitted on deletion. The check compares the
+Deployment's `spec.template` against the target ReplicaSet's template, ignoring only the
+`pod-template-hash` label (the same EqualIgnoreHash the Deployment controller uses) — an image
+change, a `rollout restart`, every case where the template changes is caught the same way. The
+exception is `spec.paused`: with a paused Deployment the rule does not apply even if the
+templates differ, because the rollout is not actually moving and the premise of "already being
+replaced" breaks. Replacements are maintained as usual and only hand-over is held back by
+Healthy(D), until the rollout resumes and this rule catches it.
+
+**If either deletion is rejected by its preconditions, the round ends.** A rejection means the
+Pod changed between the decision and the deletion. Rather than carry a stale list into
+hand-over, the round ends with a short requeue and the next round decides everything again from
+the current state. That is why hand-over does not need to re-check for replacements seated on a
+draining node.
+
+**Pods already handed over are not counted.** The `soft-drain.com/replaces` label is removed as
+part of the hand-over, so they are not candidates to begin with. This is what makes the
+"handed over but the target survived" case recover on its own: if `replicas` goes up at the
+moment of hand-over, the surplus is absorbed by the increase and nothing is deleted — and the
+next round sees "the target is still there and nothing stands in for it" and creates one more.
+
+**Both the creating and the deleting side must be able to wake us.** With only the traversal
+that starts from the node, a pruned ReplicaSet takes the target Pods with it, leaving nothing
+to traverse and no reason to ever look at the replacements again. So there is a separate path
+keyed on the replacement Pod itself. The decision is the same single rule above.
+
+A replacement is built like this.
 
 ```yaml
 metadata:
-  generateName: aaa-5449d4d8c8-        # 타깃의 ReplicaSet 이름 + "-"
+  generateName: aaa-5449d4d8c8-        # the target's ReplicaSet name + "-"
   labels:
-    app: aaa                            # rs.spec.template.metadata.labels 에서
-    soft-drain.com/replaces: 3f2a...     # 타깃 Pod의 UID
-    # pod-template-hash 는 뺀다
-spec: <rs.spec.template.spec 그대로>
+    app: aaa                            # from rs.spec.template.metadata.labels
+    soft-drain.com/replaces: 3f2a...     # the target Pod's UID
+    # pod-template-hash is removed
+spec: <rs.spec.template.spec verbatim>
 ```
 
-스펙은 **살아 있는 Pod이 아니라 `rs.spec.template`에서** 가져온다. 살아 있는 Pod을 베끼면 `nodeName`이 따라오고, webhook이 이미 넣어둔 사이드카 위에 하나가 더 들어간다.
+The spec comes **from `rs.spec.template`, not from the living Pod.** Copying the living Pod
+brings `nodeName` along, and stacks another sidecar on top of the one a webhook already
+injected.
 
-`rs.spec.template.metadata.labels`에는 `pod-template-hash`가 **이미 들어 있다.** 복사한 뒤 명시적으로 제거한다. 이 문서에서 가장 중요한 한 줄이다.
+`rs.spec.template.metadata.labels` **already contains** `pod-template-hash`. It is removed
+explicitly after the copy. This is the single most important line in this document.
 
-생성이 거부되면 Warning Event를 낸다. ResourceQuota 초과나 admission webhook 거부가 여기 걸리는데, 이 경우만 Pod 오브젝트가 안 생겨서 밖에서 볼 흔적이 없다. 거부돼도 멈추지 않고 다음 라운드에 다시 시도한다.
+A rejected creation produces a Warning Event. A ResourceQuota overrun or an admission webhook
+rejection lands here, and this is the one case where no Pod object exists, so there is no trace
+to see from outside. A rejection does not stop anything; the next round tries again.
 
-### 4. 넘기기
+### Step 4. The hand-over
 
-대체 Pod이 Ready가 되면 patch 하나로 `pod-template-hash`를 붙이고 `soft-drain.com/replaces`를 뗀다.
+Once a replacement is Ready, a single patch adds `pod-template-hash` and removes
+`soft-drain.com/replaces`.
 
-붙일 hash는 **타깃 Pod의 ownerRef가 가리키는 ReplicaSet**에서 읽는다. Deployment를 거쳐 현재 ReplicaSet을 찾는 경로는 쓰지 않는다 — 대체 Pod은 타깃의 ReplicaSet 템플릿으로 만들어졌고, 롤아웃 중이면 그게 현재 ReplicaSet이 아닐 수 있다.
+The hash is read **from the ReplicaSet the target Pod's ownerRef points at**. The route through
+the Deployment to the current ReplicaSet is not used — the replacement was built from the
+target's ReplicaSet template, and during a rollout that may not be the current one.
 
-넘기기 전에 하나를 본다. drain 중인 노드에 앉은 대체는 3단계가 이미 지웠으므로 여기 오지 않는다.
+One thing is checked before handing over. Replacements seated on a draining node were already
+deleted in step 3, so they never get here.
 
-**사용자 Deployment가 Healthy한가.**
+**Is the user's Deployment healthy.**
 
 ```
 Healthy(D) ≡ D.status.observedGeneration >= D.metadata.generation
@@ -154,69 +279,114 @@ Healthy(D) ≡ D.status.observedGeneration >= D.metadata.generation
            ∧ D.status.availableReplicas >= D.spec.replicas
 ```
 
-Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과분이 없어 아무것도 지워지지 않고, 롤아웃 중이면 넘겨받을 ReplicaSet이 하나로 정해지지 않아 노출이 rollout 설정보다 더 내려갈 수 있다.
+If it is not healthy, hold. Below `N` the hand-over creates no surplus and nothing gets
+deleted; mid-rollout there is no single ReplicaSet to hand over to, and exposure could fall
+further than the rollout settings allow.
 
-`replicas == updatedReplicas` 항이 "Pod을 가진 ReplicaSet이 하나뿐"을 판정한다. 나머지 두 항만으로는 롤아웃을 못 잡는다 — `maxUnavailable: 0`이면 `availableReplicas >= N`이 롤아웃 내내 유지되는데, 무중단을 원하는 사용자가 정확히 그 설정을 쓴다. `spec.paused`도 이 항에 걸린다.
+The `replicas == updatedReplicas` term is what decides "only one ReplicaSet has Pods". The
+other two terms cannot catch a rollout on their own: with `maxUnavailable: 0`,
+`availableReplicas >= N` holds for the entire rollout — and that is exactly the setting a user
+who wants zero downtime uses. `spec.paused` is caught by this term as well.
 
-판정은 Deployment마다 따로 하고 준비된 것부터 넘긴다. 묶으면 제일 느린 하나가 나머지를 인질로 잡는다.
+The check is per Deployment, and whichever is ready hands over first. Batching them lets the
+slowest one hold the rest hostage.
 
-### 5. 완료
+### Step 5. Completion
 
-노드 위에 타깃이 하나도 없으면 `state=Complete`를 붙인 뒤 Event를 낸다. `cordoned-by-controller` 어노테이션은 그대로 둔다 — cordon은 여전히 우리가 건 것이고, drain 라벨이 걷힐 때 함께 걷힌다. `Complete`는 래치다 — cordon이 유지되는 동안에는 drain 라벨이 걷힐 때까지 관여하지 않는다. cordon된 노드에 새로 앉을 수 있는 건 `unschedulable`을 tolerate하는 Pod뿐인데, 그건 어차피 옮기지 못하는 부류다. 래치가 없으면 리부팅을 기다리는 노드가 도로 열려 Pod이 몰린 채로 리부팅하게 된다 — 노드를 여는 순간은 사람이 라벨을 걷을 때(반환)와 uncordon할 때(취소)뿐이어야 한다.
+With no targets left on the node, `state=Complete` is set and an Event is emitted. The
+`cordoned-by-controller` annotation stays — the cordon is still ours, and it comes off when the
+drain label does. `Complete` is a latch: while the cordon holds, we do not act again until the
+drain label is removed. The only Pods that can newly land on a cordoned node are the ones that
+tolerate `unschedulable`, and those are the kind we cannot move anyway. Without the latch a
+node waiting for its reboot would reopen and be rebooted with Pods crowded back onto it — the
+only moments a node opens should be a human removing the label (hand-back) and a human
+uncordoning it (cancel).
 
-사람이 uncordon하면 래치는 `Cancelled`로 접힌다(1번). 착지 금지도 함께 풀린다 — 리부팅하러 갈 노드라서 막았던 것인데, uncordon은 리부팅 안 간다는 선언이다. uncordon과 감지 사이의 짧은 창에서는 착지한 대체 Pod이 지워질 수 있지만, 다음 라운드가 새로 만든다.
+A human uncordoning folds the latch into `Cancelled` (step 1). The landing ban lifts with it —
+it existed because the node was headed for a reboot, and an uncordon declares that it is not.
+In the short window between the uncordon and our noticing it, a landed replacement can still be
+deleted, but the next round creates a new one.
 
-**완료 판정에는 terminating 타깃도 센다.** `deletionTimestamp`가 찍혀도 grace period 동안 계속 돈다. 여기서 빼면 아직 작업이 돌고 있는 노드에 `Complete`가 붙고, 그걸 보고 노드를 리부팅한 사람이 그 작업을 죽인다. 만들기에서는 빼고 완료 판정에서는 세는 이유가 이것이다.
+**Terminating targets do count toward completion.** A `deletionTimestamp` does not stop the
+work; it keeps running for the grace period. Excluding them would put `Complete` on a node
+whose work is still running, and the human who reboots the node on that signal kills it. That
+is the reason they are excluded from creation but counted for completion.
 
-## 메타데이터
+## Metadata
 
-| 대상 | 키 | 값 | 쓰는 쪽 |
+| Object | Key | Value | Written by |
 |---|---|---|---|
-| 노드 | `soft-drain.com/drain` (라벨) | `"true"` | 사람 |
-| 노드 | `soft-drain.com/state` (라벨) | `InProgress` / `Complete` / `Cancelled` | 컨트롤러 |
-| 노드 | `soft-drain.com/cordoned-by-controller` (어노테이션) | `"true"` | 컨트롤러 |
-| 타깃 Pod | `controller.kubernetes.io/pod-deletion-cost` (어노테이션) | `-2147483648` | 컨트롤러 |
-| 대체 Pod | `soft-drain.com/replaces` (라벨) | 타깃 Pod의 UID | 컨트롤러 |
+| Node | `soft-drain.com/drain` (label) | `"true"` | human |
+| Node | `soft-drain.com/state` (label) | `InProgress` / `Complete` / `Cancelled` | controller |
+| Node | `soft-drain.com/cordoned-by-controller` (annotation) | `"true"` | controller |
+| Target Pod | `controller.kubernetes.io/pod-deletion-cost` (annotation) | `-2147483648` | controller |
+| Replacement Pod | `soft-drain.com/replaces` (label) | the target Pod's UID | controller |
 
-`soft-drain.com/replaces`를 쓰는 것은 우리뿐이다. 이 라벨이 없는 Pod은 만들지도 지우지도 않는다.
+Nothing but soft-drain writes `soft-drain.com/replaces`. A Pod without that label is neither
+created nor deleted by us.
 
-## 지켜야 할 것
+## Invariants
 
-1. 대체 Pod은 `pod-template-hash` 없이 만든다.
-2. 대체 Pod의 스펙은 살아 있는 Pod이 아니라 `rs.spec.template`에서 가져온다.
-3. `pod-deletion-cost`를 먼저 쓰고 `pod-template-hash`를 나중에 붙인다.
-4. `soft-drain.com/replaces` 라벨이 있는 Pod만 지운다.
-5. controller ownerRef가 있는 Pod은 지우지 않는다.
-6. 대체 Pod을 지울 때는 읽었던 UID와 resourceVersion을 preconditions로 건다. 판정과 삭제 사이에 hash가 붙어 ReplicaSet이 데려간 Pod이면 삭제가 거부되고, 다음 라운드가 다시 판정한다.
+1. A replacement is created without `pod-template-hash`.
+2. A replacement's spec comes from `rs.spec.template`, not from the living Pod.
+3. `pod-deletion-cost` is written first, `pod-template-hash` attached later.
+4. Only Pods carrying the `soft-drain.com/replaces` label are deleted.
+5. Pods with a controller ownerRef are never deleted.
+6. Deleting a replacement uses the UID and resourceVersion we read as preconditions. If the
+   hash was attached in between and a ReplicaSet took the Pod, the deletion is rejected and the
+   next round decides again.
 
-## 안 하는 것
+## Non-goals
 
-- Deployment 소속 Pod만 옮긴다. StatefulSet, DaemonSet, Job, 직접 만든 Pod은 그대로 둔다. **`Complete`는 "내 몫이 끝났다"이지 "노드가 비었다"가 아니다.**
-- 노드 위 대상 Pod을 한꺼번에 옮긴다. 자원이 모자라면 Pending으로 기다린다.
-- 옮길 수 없는 워크로드를 미리 걸러내지 않는다. Pending으로 남고 사람이 보면 된다.
-- PDB를 조회하지 않는다. 지우는 주체가 사용자 ReplicaSet이라 eviction API를 타지 않는다.
-- 사용자 Deployment의 `spec`을 수정하지 않는다. 사용자 Pod에는 어노테이션 하나만 쓴다.
-- 노드를 drain하거나 끄지 않는다.
+- Only Pods belonging to a Deployment are moved. StatefulSets, DaemonSets, Jobs and
+  hand-made Pods are left as they are. **`Complete` means "my part is done", not "the node is
+  empty".**
+- Every eligible Pod on the node is moved at once. If resources run short, they wait as
+  Pending.
+- Workloads that cannot be moved are not filtered out ahead of time. They stay Pending and a
+  human can look.
+- PDBs are not consulted. The deletion is performed by the user's ReplicaSet, so it never goes
+  through the eviction API.
+- The user's Deployment `spec` is never modified. On user Pods we write exactly one annotation.
+- Nodes are neither drained nor shut down.
 
-## 막혔을 때 보는 법
+## Reading a stuck node
 
-노드가 `InProgress`에서 안 움직이면 대체 Pod을 본다.
+When a node sits at `InProgress`, look at the replacements.
 
 ```bash
 kubectl get pods -A -l soft-drain.com/replaces
-kubectl describe pod <Pending 인 것>
+kubectl describe pod <the Pending one>
 ```
 
-스케줄러가 `PodScheduled=False`의 message에 이유를 그대로 써 둔다 — `0/12 nodes are available: 5 Insufficient cpu, 7 node(s) didn't match pod anti-affinity rules` 같은 식이다. 컨트롤러가 따로 진단을 만들지 않는 이유다.
+The scheduler writes the reason verbatim into the message of `PodScheduled=False` — something
+like `0/12 nodes are available: 5 Insufficient cpu, 7 node(s) didn't match pod anti-affinity
+rules`. That is why the controller does not produce a diagnosis of its own.
 
-대체 Pod이 하나도 안 보이면 생성이 거부됐거나(ResourceQuota, admission webhook), 롤아웃이 이주를 대신 수행 중이라 만들지 않는 것이다. 어느 쪽이든 `kubectl describe node <노드>`의 Event에 남는다.
+If no replacement is there at all, either the creation was rejected (ResourceQuota, admission
+webhook) or a rollout is performing the migration instead, so none is created. Either way it is
+in the Events of `kubectl describe node <node>`.
 
-## 알려진 한계
+## Known limitations
 
-- **여유 자원이 없으면 진행하지 못한다.** 자리는 옛 Pod이 죽어야 나고 옛 Pod은 새 Pod이 Ready여야 죽으므로, 여유가 0이면 스스로 풀리지 않는다. RWO 볼륨과 로컬 PV도 같은 구조다.
-- **배치 규칙이 한 자리를 못 내주면 자원이 남아돌아도 진행하지 못한다.** 노드당 하나로 제한하는 required `podAntiAffinity`를 걸어두고 후보 노드를 전부 채운 경우가 대표적이다. 이건 soft-drain만의 제약이 아니라 "먼저 띄우고 나중에 지운다"는 방식 전체의 산술이다 — 같은 워크로드는 `maxSurge: 1` 롤아웃도 똑같이 막힌다. 그래서 그런 사용자는 이미 `maxUnavailable: 1`로 운영하며 롤아웃마다 `N` 밑으로 내려가는 것을 감수하고 있다. 노드를 뺄 때도 `kubectl drain`을 쓰면 된다.
-- **`node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 옮기지 못할 수 있다.** 대체 Pod이 drain 노드에 앉을 때마다 지우고 다시 만들기를 반복하고, 다른 노드에 앉는 운이 따라야 끝난다.
-- **입양 전 대체 Pod은 controller가 없어 PDB 집계를 흔든다.** 같은 라벨을 갖고 Ready라 `currentHealthy`에는 들어가는데 `expectedCount`에는 안 들어가서, 그동안 `disruptionsAllowed`가 1 늘어난다. PDB가 지키는 바닥 아래로 내려가지는 않는다. 같은 이유로 사용자 PDB에 `UnmanagedPods` Warning이 쌓인다.
-- **주인 없는 대체 Pod이 있는 노드는 Cluster Autoscaler가 축소하지 못한다.** 넘기기가 멈춘 상태로 오래 가면 그 노드가 컨솔리데이션에서 계속 빠진다.
-- **사용자 Pod의 `pod-deletion-cost` 원래 값은 복원하지 않는다.**
-- **`pod-deletion-cost`가 필요하므로 Kubernetes 1.22 이상이어야 한다.**
+- **With no spare capacity there is no progress.** A slot opens only when an old Pod dies, and
+  an old Pod dies only once a new one is Ready, so at zero headroom nothing resolves itself.
+  RWO volumes and local PVs have the same shape.
+- **If placement rules cannot yield a single slot, there is no progress even with resources to
+  spare.** The typical case is a required `podAntiAffinity` limiting one per node with every
+  candidate node already filled. This is not a soft-drain constraint but the arithmetic of
+  "bring it up first, delete it later" in general — the same workload also blocks a
+  `maxSurge: 1` rollout. Which is why such users already run with `maxUnavailable: 1` and accept
+  dropping below `N` on every rollout. They can use `kubectl drain` to take a node out too.
+- **A workload tolerating `node.kubernetes.io/unschedulable` may never move.** Every time a
+  replacement lands on the draining node it is deleted and recreated, and it only ends if one
+  happens to land elsewhere.
+- **Before adoption a replacement has no controller, which skews PDB accounting.** It carries
+  the same labels and is Ready, so it counts toward `currentHealthy` but not toward
+  `expectedCount`, which raises `disruptionsAllowed` by one for that period. It never goes below
+  the floor the PDB protects. For the same reason `UnmanagedPods` Warnings accumulate on the
+  user's PDB.
+- **The Cluster Autoscaler cannot scale down a node holding an ownerless replacement.** If
+  hand-over stays stalled for long, that node keeps being excluded from consolidation.
+- **The original `pod-deletion-cost` value on a user Pod is not restored.**
+- **`pod-deletion-cost` is required, so Kubernetes 1.22 or newer is needed.**
