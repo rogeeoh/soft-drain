@@ -254,12 +254,14 @@ func statusRow(ctx context.Context, cs kubernetes.Interface, n *corev1.Node) (no
 	if err != nil {
 		return row, err
 	}
-	uids := map[types.UID]string{}
+	owners := map[types.UID]string{}
 	for _, p := range targets {
-		uids[p.UID] = p.Namespace + "/" + p.Name
+		if ref := replicaSetOf(&p); ref != nil {
+			owners[ref.UID] = ref.Name
+		}
 		row.Targets = append(row.Targets, podRef{Namespace: p.Namespace, Name: p.Name})
 	}
-	for _, p := range replacementsFor(ctx, cs, uids) {
+	for _, p := range replacementsFor(ctx, cs, owners) {
 		r := replacementStatus{
 			Namespace: p.Namespace,
 			Name:      p.Name,
@@ -327,6 +329,7 @@ func runDrain(ctx context.Context, cs kubernetes.Interface, nodes []string, wait
 
 func watchDrains(ctx context.Context, cs kubernetes.Interface, nodes []string) error {
 	seenTargets := map[types.UID]string{}
+	seenRS := map[types.UID]string{}
 	replReady := map[string]bool{}
 	pending := map[string]bool{}
 	for _, n := range nodes {
@@ -341,7 +344,7 @@ func watchDrains(ctx context.Context, cs kubernetes.Interface, nodes []string) e
 		case <-ctx.Done():
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				for node := range pending {
-					diagnose(cs, node, seenTargets)
+					diagnose(cs, node, seenRS)
 				}
 				return errors.New("timed out waiting; the drains keep running (labels remain)")
 			}
@@ -373,6 +376,9 @@ func watchDrains(ctx context.Context, cs kubernetes.Interface, nodes []string) e
 			current := map[types.UID]bool{}
 			for _, p := range targets {
 				current[p.UID] = true
+				if ref := replicaSetOf(&p); ref != nil {
+					seenRS[ref.UID] = ref.Name
+				}
 				if _, ok := seenTargets[p.UID]; !ok {
 					seenTargets[p.UID] = p.Namespace + "/" + p.Name
 					fmt.Printf("moving pod %s\n", seenTargets[p.UID])
@@ -386,14 +392,14 @@ func watchDrains(ctx context.Context, cs kubernetes.Interface, nodes []string) e
 			}
 		}
 
-		for _, p := range replacementsFor(ctx, cs, seenTargets) {
+		for _, p := range replacementsFor(ctx, cs, seenRS) {
 			key := p.Namespace + "/" + p.Name
 			if ready := podIsReady(&p); ready && !replReady[key] {
 				replReady[key] = true
 				fmt.Printf("replacement %s ready on %s\n", key, p.Spec.NodeName)
 			} else if _, known := replReady[key]; !known {
 				replReady[key] = false
-				fmt.Printf("replacement %s created (for %s)\n", key, seenTargets[types.UID(p.Labels[sd.LabelReplaces])])
+				fmt.Printf("replacement %s created (for replicaset %s)\n", key, seenRS[types.UID(p.Labels[sd.LabelReplaces])])
 			}
 		}
 	}
@@ -405,7 +411,7 @@ func watchDrains(ctx context.Context, cs kubernetes.Interface, nodes []string) e
 
 // diagnose automates "reading a stuck node" — it shows the scheduler's message for
 // Pending replacements verbatim.
-func diagnose(cs kubernetes.Interface, node string, seenTargets map[types.UID]string) {
+func diagnose(cs kubernetes.Interface, node string, seenRS map[types.UID]string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	remaining, err := markedPods(ctx, cs, node)
@@ -413,7 +419,7 @@ func diagnose(cs kubernetes.Interface, node string, seenTargets map[types.UID]st
 		return
 	}
 	fmt.Fprintf(os.Stderr, "%d pod(s) still on node/%s\n", len(remaining), node)
-	for _, p := range replacementsFor(ctx, cs, seenTargets) {
+	for _, p := range replacementsFor(ctx, cs, seenRS) {
 		if podIsReady(&p) {
 			continue
 		}
@@ -508,7 +514,9 @@ func markedPods(ctx context.Context, cs kubernetes.Interface, node string) ([]co
 	return marked, nil
 }
 
-func replacementsFor(ctx context.Context, cs kubernetes.Interface, targets map[types.UID]string) []corev1.Pod {
+// replacementsFor returns the replacements of the given ReplicaSets — the replaces label
+// carries the target ReplicaSet's UID.
+func replacementsFor(ctx context.Context, cs kubernetes.Interface, owners map[types.UID]string) []corev1.Pod {
 	list, err := cs.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		LabelSelector: sd.LabelReplaces,
 	})
@@ -517,11 +525,20 @@ func replacementsFor(ctx context.Context, cs kubernetes.Interface, targets map[t
 	}
 	var repls []corev1.Pod
 	for _, p := range list.Items {
-		if _, ours := targets[types.UID(p.Labels[sd.LabelReplaces])]; ours {
+		if _, ours := owners[types.UID(p.Labels[sd.LabelReplaces])]; ours {
 			repls = append(repls, p)
 		}
 	}
 	return repls
+}
+
+// replicaSetOf returns the Pod's controller reference when it is an apps/v1 ReplicaSet.
+func replicaSetOf(pod *corev1.Pod) *metav1.OwnerReference {
+	ref := metav1.GetControllerOf(pod)
+	if ref == nil || ref.Kind != "ReplicaSet" || ref.APIVersion != "apps/v1" {
+		return nil
+	}
+	return ref
 }
 
 func podIsReady(pod *corev1.Pod) bool {

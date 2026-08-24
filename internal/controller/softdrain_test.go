@@ -34,6 +34,7 @@ func rsFixture() *appsv1.ReplicaSet {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "aaa-5449d4d8c8",
 			Namespace: "default",
+			UID:       "3f2a-rs-uid",
 			Labels:    map[string]string{"app": "aaa", LabelPodTemplateHash: fixtureHash},
 			OwnerReferences: []metav1.OwnerReference{{
 				APIVersion: "apps/v1", Kind: "Deployment", Name: "aaa", Controller: ptr.To(true),
@@ -54,7 +55,7 @@ func rsFixture() *appsv1.ReplicaSet {
 
 func TestBuildReplacement(t *testing.T) {
 	rs := rsFixture()
-	pod := buildReplacement(rs, "3f2a-uid")
+	pod := buildReplacement(rs)
 
 	if pod.GenerateName != "aaa-5449d4d8c8-" {
 		t.Errorf("generateName = %q, want %q", pod.GenerateName, "aaa-5449d4d8c8-")
@@ -68,7 +69,7 @@ func TestBuildReplacement(t *testing.T) {
 	if pod.Labels["app"] != "aaa" {
 		t.Errorf("app label = %q", pod.Labels["app"])
 	}
-	if pod.Labels[LabelReplaces] != "3f2a-uid" {
+	if pod.Labels[LabelReplaces] != "3f2a-rs-uid" {
 		t.Errorf("replaces label = %q", pod.Labels[LabelReplaces])
 	}
 	// cost left on a replacement makes that Pod die first in every scale-down after adoption
@@ -88,8 +89,8 @@ func TestBuildReplacementNilMaps(t *testing.T) {
 	rs := rsFixture()
 	rs.Spec.Template.Labels = nil
 	rs.Spec.Template.Annotations = nil
-	pod := buildReplacement(rs, "uid")
-	if pod.Labels[LabelReplaces] != "uid" {
+	pod := buildReplacement(rs)
+	if pod.Labels[LabelReplaces] != "3f2a-rs-uid" {
 		t.Errorf("replaces label = %q", pod.Labels[LabelReplaces])
 	}
 }
@@ -378,5 +379,94 @@ func TestTemplatesEqualIgnoreHash(t *testing.T) {
 				t.Error("comparison must not mutate its inputs")
 			}
 		})
+	}
+}
+
+func TestDrainCounting(t *testing.T) {
+	node := func(labels map[string]string) *corev1.Node {
+		return &corev1.Node{ObjectMeta: metav1.ObjectMeta{Labels: labels}}
+	}
+	tests := []struct {
+		name   string
+		labels map[string]string
+		want   bool
+	}{
+		{"no labels", nil, false},
+		{"draining", map[string]string{LabelDrain: "true"}, true},
+		{"in progress", map[string]string{LabelDrain: "true", LabelState: StateInProgress}, true},
+		// a Complete node is latched — late arrivals there are not acted on, so not counted
+		{"complete", map[string]string{LabelDrain: "true", LabelState: StateComplete}, false},
+		{"cancelled", map[string]string{LabelDrain: "true", LabelState: StateCancelled}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := drainCounting(node(tt.labels)); got != tt.want {
+				t.Errorf("drainCounting = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestDeploymentOverReplicas(t *testing.T) {
+	d := func(spec, status int32) *appsv1.Deployment {
+		return &appsv1.Deployment{
+			Spec:   appsv1.DeploymentSpec{Replicas: ptr.To(spec)},
+			Status: appsv1.DeploymentStatus{Replicas: status},
+		}
+	}
+	tests := []struct {
+		name string
+		d    *appsv1.Deployment
+		want bool
+	}{
+		// right after a hand-over the adopted Pod puts the count one over spec
+		{"one over", d(2, 3), true},
+		{"at spec", d(2, 2), false},
+		{"below spec", d(2, 1), false},
+		{"deployment gone", nil, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := deploymentOverReplicas(tt.d); got != tt.want {
+				t.Errorf("deploymentOverReplicas = %v, want %v", got, tt.want)
+			}
+		})
+	}
+	nilDefault := &appsv1.Deployment{Status: appsv1.DeploymentStatus{Replicas: 2}}
+	if !deploymentOverReplicas(nilDefault) {
+		t.Error("nil replicas defaults to 1, so status 2 is over")
+	}
+}
+
+func TestGroupTargets(t *testing.T) {
+	now := metav1.Now()
+	rsA := rsFixture()
+	rsB := rsFixture()
+	rsB.UID = "other-rs-uid"
+	pod := func(name string, terminating bool) *corev1.Pod {
+		p := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: name}}
+		if terminating {
+			p.DeletionTimestamp = &now
+		}
+		return p
+	}
+	groups := groupTargets([]target{
+		{pod: pod("a1", false), rs: rsA},
+		{pod: pod("b1", false), rs: rsB},
+		{pod: pod("a2", true), rs: rsA}, // terminating — the ReplicaSet replaces it itself
+		{pod: pod("a3", false), rs: rsA},
+	})
+	if len(groups) != 2 {
+		t.Fatalf("groups = %d, want 2", len(groups))
+	}
+	// first-seen order keeps the round deterministic
+	if groups[0].rs != rsA || groups[1].rs != rsB {
+		t.Error("groups must keep first-seen order")
+	}
+	if groups[0].live != 2 {
+		t.Errorf("rsA live = %d, want 2 (terminating target does not raise the count)", groups[0].live)
+	}
+	if groups[1].live != 1 {
+		t.Errorf("rsB live = %d, want 1", groups[1].live)
 	}
 }

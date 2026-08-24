@@ -101,6 +101,14 @@ func podReq(pod *corev1.Pod) ctrl.Request {
 func createNode(name string, labels map[string]string) *corev1.Node {
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 	Expect(k8sClient.Create(ctx, node)).To(Succeed())
+	// Rounds now walk every drain-labeled node, so a node left labeled would leak this
+	// spec's state into every later spec's reconcile. Strip the labels when the spec ends.
+	DeferCleanup(func() {
+		patch := mergePatch(map[string]any{
+			"metadata": map[string]any{"labels": map[string]any{LabelDrain: nil, LabelState: nil}},
+		})
+		Expect(client.IgnoreNotFound(k8sClient.Patch(ctx, node, patch))).To(Succeed())
+	})
 	return node
 }
 
@@ -182,7 +190,32 @@ func createReplacement(f *fixture, nodeName string, ready bool) *corev1.Pod {
 			Namespace: "default",
 			Labels: map[string]string{
 				"app":         f.deploy.Name,
-				LabelReplaces: string(f.target.UID),
+				LabelReplaces: string(f.rs.UID),
+			},
+		},
+		Spec: corev1.PodSpec{NodeName: nodeName, Containers: simpleContainer()},
+	}
+	Expect(k8sClient.Create(ctx, repl)).To(Succeed())
+	if ready {
+		repl.Status = corev1.PodStatus{
+			Phase:      corev1.PodRunning,
+			Conditions: []corev1.PodCondition{{Type: corev1.PodReady, Status: corev1.ConditionTrue}},
+		}
+		Expect(k8sClient.Status().Update(ctx, repl)).To(Succeed())
+	}
+	return repl
+}
+
+// createReplacementNamed is createReplacement with a caller-chosen name, for specs where
+// the age order must be deterministic — equal creation timestamps fall back to the name.
+func createReplacementNamed(f *fixture, name, nodeName string, ready bool) *corev1.Pod {
+	repl := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: "default",
+			Labels: map[string]string{
+				"app":         f.deploy.Name,
+				LabelReplaces: string(f.rs.UID),
 			},
 		},
 		Spec: corev1.PodSpec{NodeName: nodeName, Containers: simpleContainer()},
@@ -223,10 +256,38 @@ func getPod(name string) *corev1.Pod {
 	return pod
 }
 
-func listReplacements(targetUID types.UID) []corev1.Pod {
+func listReplacements(rsUID types.UID) []corev1.Pod {
 	pods := &corev1.PodList{}
-	Expect(k8sClient.List(ctx, pods, client.MatchingLabels{LabelReplaces: string(targetUID)})).To(Succeed())
+	Expect(k8sClient.List(ctx, pods, client.MatchingLabels{LabelReplaces: string(rsUID)})).To(Succeed())
 	return pods.Items
+}
+
+func liveReplacements(rsUID types.UID) []corev1.Pod {
+	var live []corev1.Pod
+	for _, p := range listReplacements(rsUID) {
+		if p.DeletionTimestamp == nil {
+			live = append(live, p)
+		}
+	}
+	return live
+}
+
+// addTarget seats one more Pod of the fixture's ReplicaSet on the given node.
+func addTarget(f *fixture, nodeName string) *corev1.Pod {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      uniq(f.rs.Name + "-target"),
+			Namespace: "default",
+			Labels:    map[string]string{"app": f.deploy.Name, LabelPodTemplateHash: testHash},
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: "apps/v1", Kind: "ReplicaSet", Name: f.rs.Name, UID: f.rs.UID,
+				Controller: ptr.To(true),
+			}},
+		},
+		Spec: corev1.PodSpec{NodeName: nodeName, Containers: simpleContainer()},
+	}
+	Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+	return pod
 }
 
 var _ = Describe("NodeReconciler", func() {
@@ -244,7 +305,7 @@ var _ = Describe("NodeReconciler", func() {
 		target := getPod(f.target.Name)
 		Expect(target.Annotations[AnnotationPodDeletionCost]).To(Equal(PodDeletionCost))
 
-		repls := listReplacements(f.target.UID)
+		repls := listReplacements(f.rs.UID)
 		Expect(repls).To(HaveLen(1))
 		repl := repls[0]
 		Expect(repl.Name).To(HavePrefix(f.rs.Name + "-"))
@@ -290,7 +351,7 @@ var _ = Describe("NodeReconciler", func() {
 
 		got := getPod(repl.Name)
 		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
-		Expect(got.Labels[LabelReplaces]).To(Equal(string(f.target.UID)))
+		Expect(got.Labels[LabelReplaces]).To(Equal(string(f.rs.UID)))
 	})
 
 	It("deletes a replacement that landed on a draining node and recreates it in the same round", func() {
@@ -307,13 +368,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(f.rec.has("ReplacementOnDrainingNode")).To(BeTrue())
 
 		// terminating does not count as existing, so the round that deleted it creates a new one at once
-		var live int
-		for _, p := range listReplacements(f.target.UID) {
-			if p.DeletionTimestamp == nil {
-				live++
-			}
-		}
-		Expect(live).To(Equal(1))
+		Expect(liveReplacements(f.rs.UID)).To(HaveLen(1))
 	})
 
 	It("deletes a pending replacement once its landing node starts draining", func() {
@@ -357,13 +412,7 @@ var _ = Describe("NodeReconciler", func() {
 		// while stale, nothing is created again — the migration belongs to the rollout
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
-		var live int
-		for _, p := range listReplacements(f.target.UID) {
-			if p.DeletionTimestamp == nil {
-				live++
-			}
-		}
-		Expect(live).To(Equal(0))
+		Expect(liveReplacements(f.rs.UID)).To(BeEmpty())
 
 		// it resumes once the generation comes back
 		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
@@ -371,13 +420,7 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(k8sClient.Update(ctx, fresh)).To(Succeed())
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
-		live = 0
-		for _, p := range listReplacements(f.target.UID) {
-			if p.DeletionTimestamp == nil {
-				live++
-			}
-		}
-		Expect(live).To(Equal(1))
+		Expect(liveReplacements(f.rs.UID)).To(HaveLen(1))
 	})
 
 	It("keeps the replacement when the template changed but the Deployment is paused", func() {
@@ -479,16 +522,170 @@ var _ = Describe("NodeReconciler", func() {
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
-		var live []corev1.Pod
-		for _, p := range listReplacements(f.target.UID) {
-			if p.DeletionTimestamp == nil {
-				live = append(live, p)
-			}
-		}
+		live := liveReplacements(f.rs.UID)
 		Expect(live).To(HaveLen(1))
 		Expect(live[0].Name).NotTo(Equal(repl.Name))
 		// the handed-over Pod was left untouched
 		Expect(getPod(repl.Name).Labels).NotTo(HaveKey(LabelReplaces))
+	})
+
+	It("keeps one shared set per ReplicaSet across draining nodes", func() {
+		f := setupFixture()
+		second := createNode(uniq("drain-node"), map[string]string{LabelDrain: "true"})
+		away := addTarget(f, second.Name)
+
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// one round reconciles the shared set: two targets, two replacements
+		Expect(liveReplacements(f.rs.UID)).To(HaveLen(2))
+		// the other node's target is marked by the same round — the write is idempotent
+		Expect(getPod(away.Name).Annotations[AnnotationPodDeletionCost]).To(Equal(PodDeletionCost))
+
+		// counting per node would double the set; another round changes nothing
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(liveReplacements(f.rs.UID)).To(HaveLen(2))
+	})
+
+	It("does not count targets on a Complete node", func() {
+		f := setupFixture()
+		done := createNode(uniq("drain-node"), map[string]string{LabelDrain: "true", LabelState: StateComplete})
+		// Complete is only ever set after confirming the cordon
+		done.Spec.Unschedulable = true
+		Expect(k8sClient.Update(ctx, done)).To(Succeed())
+		addTarget(f, done.Name)
+
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// the Complete node is latched — its late arrival raises no count
+		Expect(liveReplacements(f.rs.UID)).To(HaveLen(1))
+	})
+
+	It("trims the youngest replacement when a target goes away", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		gone := addTarget(f, f.node.Name)
+		older := createReplacementNamed(f, f.rs.Name+"-repl-a", other.Name, false)
+		younger := createReplacementNamed(f, f.rs.Name+"-repl-b", other.Name, false)
+
+		// two targets, two replacements — balanced, nothing to do
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(liveReplacements(f.rs.UID)).To(HaveLen(2))
+
+		// the ReplicaSet picked this target — with no pairing, only the count changes
+		Expect(k8sClient.Delete(ctx, gone)).To(Succeed())
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// the set shrinks from the end with the least readiness work
+		Expect(getPod(younger.Name).DeletionTimestamp).NotTo(BeNil())
+		Expect(getPod(older.Name).DeletionTimestamp).To(BeNil())
+	})
+
+	It("holds creation while the Deployment reports more Pods than it wants", func() {
+		f := setupFixture()
+		fresh := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
+		// the state right after a hand-over: the adoption is in, the deletion still owed
+		fresh.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: fresh.Generation,
+			Replicas:           2,
+			UpdatedReplicas:    2,
+			ReadyReplicas:      2,
+			AvailableReplicas:  2,
+		}
+		Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		// marking went ahead; creation held
+		Expect(getPod(f.target.Name).Annotations[AnnotationPodDeletionCost]).To(Equal(PodDeletionCost))
+		Expect(liveReplacements(f.rs.UID)).To(BeEmpty())
+
+		// the count returned to spec — the deletion landed — and creation resumes
+		setDeployHealthy(f.deploy)
+		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(liveReplacements(f.rs.UID)).To(HaveLen(1))
+	})
+
+	It("hands over every Ready member up to the live target count", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		addTarget(f, f.node.Name)
+		ra := createReplacementNamed(f, f.rs.Name+"-repl-a", other.Name, true)
+		rb := createReplacementNamed(f, f.rs.Name+"-repl-b", other.Name, true)
+
+		fresh := &appsv1.Deployment{}
+		Expect(k8sClient.Get(ctx, client.ObjectKeyFromObject(f.deploy), fresh)).To(Succeed())
+		fresh.Status = appsv1.DeploymentStatus{
+			ObservedGeneration: fresh.Generation,
+			Replicas:           2,
+			UpdatedReplicas:    2,
+			ReadyReplicas:      2,
+			AvailableReplicas:  2,
+		}
+		Expect(k8sClient.Status().Update(ctx, fresh)).To(Succeed())
+
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// both are within the live target count, so both go
+		for _, name := range []string{ra.Name, rb.Name} {
+			got := getPod(name)
+			Expect(got.Labels[LabelPodTemplateHash]).To(Equal(testHash))
+			Expect(got.Labels).NotTo(HaveKey(LabelReplaces))
+		}
+	})
+
+	It("deletes the excess Ready replacement instead of handing it over", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		older := createReplacementNamed(f, f.rs.Name+"-repl-a", other.Name, true)
+		excess := createReplacementNamed(f, f.rs.Name+"-repl-b", other.Name, true)
+		setDeployHealthy(f.deploy)
+
+		// one live target, two Ready members: one adoption beyond the target count would
+		// make the ReplicaSet delete a Pod at cost 0, so the trim must win over hand-over
+		_, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		handed := getPod(older.Name)
+		Expect(handed.Labels[LabelPodTemplateHash]).To(Equal(testHash))
+		Expect(handed.Labels).NotTo(HaveKey(LabelReplaces))
+
+		trimmed := getPod(excess.Name)
+		Expect(trimmed.DeletionTimestamp).NotTo(BeNil())
+		Expect(trimmed.Labels).NotTo(HaveKey(LabelPodTemplateHash))
+	})
+
+	It("a rejected trim drops the Pod from the round without folding it", func() {
+		f := setupFixture()
+		f.r.Client = &conflictOnDelete{Client: k8sClient}
+		other := createNode(uniq("other-node"), nil)
+		older := createReplacementNamed(f, f.rs.Name+"-repl-a", other.Name, true)
+		rejected := createReplacementNamed(f, f.rs.Name+"-repl-b", other.Name, true)
+		setDeployHealthy(f.deploy)
+
+		res, err := f.r.Reconcile(ctx, nodeReq(f.node))
+		Expect(err).NotTo(HaveOccurred())
+
+		// unlike the landing and rollout deletions, a rejected trim does not end the round
+		Expect(res.RequeueAfter).NotTo(Equal(time.Second))
+
+		// the survivor of the trim went through hand-over as usual
+		handed := getPod(older.Name)
+		Expect(handed.Labels[LabelPodTemplateHash]).To(Equal(testHash))
+		Expect(handed.Labels).NotTo(HaveKey(LabelReplaces))
+
+		// the changed Pod merely dropped out of the round's list: alive, not handed over
+		got := getPod(rejected.Name)
+		Expect(got.DeletionTimestamp).To(BeNil())
+		Expect(got.Labels).NotTo(HaveKey(LabelPodTemplateHash))
+		Expect(got.Labels[LabelReplaces]).To(Equal(string(f.rs.UID)))
 	})
 
 	It("attaches Complete and keeps the cordon annotation when no targets remain", func() {
@@ -571,13 +768,13 @@ var _ = Describe("NodeReconciler", func() {
 		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateComplete))
 
 		// a tolerating workload seated late
-		_, _, late := createWorkload(uniq("late"), f.node.Name)
+		_, lateRS, late := createWorkload(uniq("late"), f.node.Name)
 		_, err = f.r.Reconcile(ctx, nodeReq(f.node))
 		Expect(err).NotTo(HaveOccurred())
 
 		Expect(getNode(f.node.Name).Labels[LabelState]).To(Equal(StateComplete))
 		Expect(getPod(late.Name).Annotations).NotTo(HaveKey(AnnotationPodDeletionCost))
-		Expect(listReplacements(late.UID)).To(BeEmpty())
+		Expect(listReplacements(lateRS.UID)).To(BeEmpty())
 	})
 
 	It("cancels when uncordoned mid-drain", func() {
@@ -677,7 +874,7 @@ var _ = Describe("PodReconciler", func() {
 		return &PodReconciler{Client: k8sClient, Reader: k8sClient}
 	}
 
-	It("deletes a replacement without a target", func() {
+	It("deletes a replacement whose ReplicaSet is gone", func() {
 		repl := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      uniq("orphan"),
@@ -719,13 +916,46 @@ var _ = Describe("PodReconciler", func() {
 		Expect(getPod(repl.Name).DeletionTimestamp).NotTo(BeNil())
 	})
 
+	It("lets go of the surplus tail and keeps the oldest within the count", func() {
+		f := setupFixture()
+		other := createNode(uniq("other-node"), nil)
+		older := createReplacementNamed(f, f.rs.Name+"-repl-a", other.Name, false)
+		younger := createReplacementNamed(f, f.rs.Name+"-repl-b", other.Name, false)
+
+		// one live target: the oldest is kept, the tail deletes itself
+		_, err := newReconciler().Reconcile(ctx, podReq(younger))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getPod(younger.Name).DeletionTimestamp).NotTo(BeNil())
+
+		res, err := newReconciler().Reconcile(ctx, podReq(older))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(res.RequeueAfter).To(Equal(30 * time.Second))
+		Expect(getPod(older.Name).DeletionTimestamp).To(BeNil())
+	})
+
+	It("lets go of a replacement whose only target sits on a Complete node", func() {
+		f := setupFixture()
+		// the drain finished and latched; a target seated late on that node is not acted on,
+		// so the Pod-side count must exclude it too
+		node := getNode(f.node.Name)
+		node.Labels[LabelState] = StateComplete
+		node.Spec.Unschedulable = true
+		Expect(k8sClient.Update(ctx, node)).To(Succeed())
+		other := createNode(uniq("other-node"), nil)
+		repl := createReplacement(f, other.Name, false)
+
+		_, err := newReconciler().Reconcile(ctx, podReq(repl))
+		Expect(err).NotTo(HaveOccurred())
+		Expect(getPod(repl.Name).DeletionTimestamp).NotTo(BeNil())
+	})
+
 	It("never touches a Pod with a controller ownerRef", func() {
 		f := setupFixture()
 		adopted := &corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      uniq("adopted"),
 				Namespace: "default",
-				Labels:    map[string]string{LabelReplaces: string(f.target.UID)},
+				Labels:    map[string]string{LabelReplaces: string(f.rs.UID)},
 				OwnerReferences: []metav1.OwnerReference{{
 					APIVersion: "apps/v1", Kind: "ReplicaSet", Name: f.rs.Name, UID: f.rs.UID,
 					Controller: ptr.To(true),

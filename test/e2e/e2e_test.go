@@ -561,11 +561,24 @@ var _ = Describe("soft-drain", Ordered, func() {
 			"availability dropped during drain:\n%s", strings.Join(violations, "\n"))
 
 		By("verifying no Deployment pod remains on the drained node")
-		for app := range apps {
-			for _, p := range podsOf(app) {
-				Expect(nodeOfPod(p)).NotTo(Equal(srcNode), "pod %s of %s is still on %s", p, app, srcNode)
+		// A corpse can outlive Complete for a moment: a target that exited on SIGTERM sits
+		// in phase Succeeded until the kubelet finishes cleaning up, and such Pods are not
+		// targets by design. Poll until every remaining Pod sits elsewhere.
+		Eventually(func(g Gomega) {
+			for app := range apps {
+				for _, p := range podsOf(app) {
+					out, err := kubectl("get", "pod", "-n", "default", p,
+						"-o", "jsonpath={.spec.nodeName}")
+					if err != nil {
+						// only a Pod that is fully gone passes — a transient API error is not a pass
+						g.Expect(err.Error()).To(ContainSubstring("NotFound"))
+						continue
+					}
+					g.Expect(strings.TrimSpace(out)).NotTo(Equal(srcNode),
+						"pod %s of %s is still on %s", p, app, srcNode)
+				}
 			}
-		}
+		}, 60*time.Second, 3*time.Second).Should(Succeed())
 	})
 
 	It("waits in Pending with nowhere to go, restores when the label is removed", Label("shard-a"), func() {
@@ -803,7 +816,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		}, 2*time.Minute, 3*time.Second).Should(Succeed())
 	})
 
-	It("scale-up mid-drain still means one replacement per target", Label("shard-b"), func() {
+	It("scale-up mid-drain still keeps replacements matched to the target count", Label("shard-b"), func() {
 		const app = "sd-scaleup"
 		worker := pickWorker()
 		DeferCleanup(func() { cleanupDrain(worker, app) })
@@ -813,7 +826,7 @@ var _ = Describe("soft-drain", Ordered, func() {
 		mustKubectl("scale", "deployment", "-n", "default", app, "--replicas=3")
 
 		// the new Pods are pinned to the cordoned node and stay mis-scheduled Pending — not targets.
-		// Creating by replicas instead of "one per target" would over-create right here.
+		// Creating by replicas instead of by target count would over-create right here.
 		Consistently(func() []string { return replacementPods(app) },
 			45*time.Second, 5*time.Second).Should(HaveLen(1))
 		Expect(nodeStateLabel(worker)).To(Equal("InProgress"))

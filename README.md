@@ -26,7 +26,7 @@ soft-drain chains the two:
 
 ```mermaid
 flowchart LR
-    A["clone target Pod<br/>without pod-template-hash<br/>(invisible to the ReplicaSet)"]
+    A["build a Pod from the RS template<br/>without pod-template-hash<br/>(invisible to the ReplicaSet)"]
     B["wait until Ready<br/>(already serving via Service)"]
     C["one patch:<br/>attach pod-template-hash"]
     D["ReplicaSet adopts it,<br/>sees a surplus, deletes the<br/>old Pod (lowest deletion cost)"]
@@ -156,8 +156,9 @@ gated on the Deployment being healthy (no rollout in flight, availability at spe
 
 **Not guaranteed:** *which* Pod dies. `pod-deletion-cost` is a hint, fourth in the
 deletion sort order. If an unrelated Pod happens to be NotReady at handover time the
-ReplicaSet may delete that one instead — exposure still never dips, and the remaining
-target is retried next round.
+ReplicaSet may delete that one instead — exposure still never dips. Replacements are
+kept per ReplicaSet rather than paired to a Pod, so whichever target goes settles the
+count, and a deletion that misses every target is simply made up for next round.
 
 **Scope:** Deployment-owned Pods only. StatefulSets, DaemonSets, Jobs, and bare Pods
 are left untouched — `Complete` means "my share is done", not "the node is empty".

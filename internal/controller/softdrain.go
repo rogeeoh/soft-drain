@@ -59,6 +59,14 @@ func drainActive(node *corev1.Node) bool {
 	return draining(node) && node.Labels[LabelState] != StateCancelled
 }
 
+// drainCounting reports whether the node's targets are the ones being replaced
+// (DESIGN.md step 3). A Complete node is latched — late arrivals there are not acted
+// on — so it is narrower than drainActive: Complete still bans landings but no longer
+// counts targets.
+func drainCounting(node *corev1.Node) bool {
+	return drainActive(node) && node.Labels[LabelState] != StateComplete
+}
+
 // replicaSetRef returns the reference when the Pod's controller is an apps/v1 ReplicaSet.
 func replicaSetRef(pod *corev1.Pod) *metav1.OwnerReference {
 	ref := metav1.GetControllerOf(pod)
@@ -109,8 +117,8 @@ func templatesEqualIgnoreHash(a, b *corev1.PodTemplateSpec) bool {
 }
 
 // buildReplacement builds a replacement Pod from rs.spec.template.
-// Copying the living Pod would bring nodeName and webhook-injected sidecars along.
-func buildReplacement(rs *appsv1.ReplicaSet, targetUID types.UID) *corev1.Pod {
+// Copying a living Pod would bring nodeName and webhook-injected sidecars along.
+func buildReplacement(rs *appsv1.ReplicaSet) *corev1.Pod {
 	tpl := rs.Spec.Template.DeepCopy()
 
 	labels := tpl.Labels
@@ -120,7 +128,7 @@ func buildReplacement(rs *appsv1.ReplicaSet, targetUID types.UID) *corev1.Pod {
 	// rs.spec.template.metadata.labels already carries the hash.
 	// With the hash the ReplicaSet adopts a Pending Pod and deletes that one first.
 	delete(labels, LabelPodTemplateHash)
-	labels[LabelReplaces] = string(targetUID)
+	labels[LabelReplaces] = string(rs.UID)
 
 	// pod-deletion-cost is for targets only. Left on a replacement, that Pod dies first
 	// in every scale-down after adoption.
@@ -133,6 +141,13 @@ func buildReplacement(rs *appsv1.ReplicaSet, targetUID types.UID) *corev1.Pod {
 		},
 		Spec: tpl.Spec,
 	}
+}
+
+// deploymentOverReplicas reports whether a deletion is already owed (DESIGN.md step 3).
+// Right after a hand-over the ReplicaSet runs one over replicas and is about to delete a
+// target; a replacement created inside that window only ever meets the youngest-first trim.
+func deploymentOverReplicas(d *appsv1.Deployment) bool {
+	return d != nil && d.Status.Replicas > ptr.Deref(d.Spec.Replicas, 1)
 }
 
 func sortPodsByAge(pods []*corev1.Pod) {

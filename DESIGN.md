@@ -37,10 +37,13 @@ replacement therefore enters Endpoints as soon as it is Ready and never drops ou
 adoption. One endpoint update per Pod, no more.
 
 **What is guaranteed is exposure, not which Pod gets deleted.** `pod-deletion-cost` is the
-fourth-ranked hint in the deletion ordering. If an unrelated Pod is NotReady at the moment of
-hand-over, the ReplicaSet deletes that one and our target survives. Exposure still never falls
-below `N`, because a Ready Pod is added before the surplus is removed, and the surviving target
-is tried again in the next round.
+fourth-ranked hint in the deletion ordering. All targets carry the same value, so among them
+the ReplicaSet picks by its own later criteria; if an unrelated Pod is NotReady at the moment
+of hand-over, it deletes that one and every target survives. Exposure still never falls below
+`N`, because a Ready Pod is added before the surplus is removed. And because replacements are
+kept per ReplicaSet rather than paired to a Pod (step 3), the pick does not matter: any
+deletion that lands on a target settles the count, and one that misses every target leaves
+the set one short for the next round to refill.
 
 ## Usage
 
@@ -82,8 +85,10 @@ label to restore it first, then puts it back.
 
 The dashboard has no "since when" — the controller is memoryless and records the start time
 nowhere. What `-o` is for is the aggregation only the plugin can compute: targets, replacement
-status, scheduler messages. A machine that needs a list of node names should query labels, as
-usual: `kubectl get nodes -l soft-drain.com/state=Complete -o name`.
+status, scheduler messages. Replacements belong to a ReplicaSet, not to a node (step 3), so a
+set shared by two draining nodes shows under each of their rows — it serves both. A machine
+that needs a list of node names should query labels, as usual:
+`kubectl get nodes -l soft-drain.com/state=Complete -o name`.
 
 There is no `--ignore-daemonsets`, `--delete-emptydir-data` or `--force`. Those are concepts
 that presuppose eviction, and none applies here.
@@ -93,7 +98,7 @@ that presuppose eviction, and none applies here.
 ```
 1. cordon the node carrying the drain label
 2. write a negative pod-deletion-cost on that node's Deployment Pods (the targets)
-3. keep one replacement Pod per target
+3. keep as many replacement Pods per ReplicaSet as it has targets
 4. once a replacement is Ready, attach pod-template-hash so the ReplicaSet takes it
 5. repeat until no targets are left
 6. with no targets left, mark it complete
@@ -162,22 +167,56 @@ ours.
 
 ### Step 3. Matching replacements
 
-This step does not only create. **It reconciles the set that should exist against the set that
-does.**
+This step does not only create. **It reconciles, per ReplicaSet, the set that should exist
+against the set that does.**
 
 ```
-should exist = one per target without a deletionTimestamp
-does exist   = Pods with soft-drain.com/replaces = <target UID>
+should exist = one per target of that ReplicaSet without a deletionTimestamp,
+               counted across every draining node
+does exist   = Pods with soft-drain.com/replaces = <the ReplicaSet's UID>
                that have no controller ownerRef,
                are not in phase Failed / Succeeded,
                and have no deletionTimestamp
 
-too few, create; too many, delete
+too few, create; too many, delete — the youngest first
 ```
 
-**When a target goes away, so does its replacement.** Cancellation, a ReplicaSet pruned by a
+**A replacement stands in for the ReplicaSet, not for one Pod.** Every child of a ReplicaSet
+is built from the same template, so any replacement can take any target's place — and the
+deleting side never honoured a pairing anyway: with all targets at the same
+`pod-deletion-cost`, which one the ReplicaSet removes is decided by its own later criteria.
+Bookkeeping per pair would call that pick a mismatch, discard the paired replacement
+mid-startup, and rebuild one for the survivor; counting per ReplicaSet makes the pick a
+non-event. Whichever target dies, the need shrinks by one and the set already matches.
+
+**The set spans every draining node.** Replacements carry no node of their own, so two drains
+sharing a ReplicaSet share one set; counting per node would double it. A round therefore
+counts that ReplicaSet's targets on all draining nodes — marking them as in step 2, since the
+write is idempotent — and reconciles the one shared set. A `Complete` node is latched and its
+late arrivals are not acted on, so its Pods are not counted; a `Cancelled` node is an ordinary
+node again.
+
+**Surplus is deleted youngest first.** The set only ever shrinks from the end that has
+invested the least readiness work. A replacement that has been warming up for ten minutes is
+never the one discarded; the one just created is.
+
+**While the Deployment reports more Pods than it wants, nothing is created.** Right after a
+hand-over the adopted Pod leaves the set — it has a controller now — while the target it
+displaces is still running, so the count comes up one short; seconds later the ReplicaSet's
+deletion settles it. A Pod created inside that window has no future but the youngest-first
+trim. `D.status.replicas > D.spec.replicas` is that window made readable: a deletion is
+already owed, and the drained node's Pods are first in line for it, so creation for that
+Deployment's targets holds until the count returns to spec. The signal travels through
+status, though — the patch shrinks the set instantly while the report catches up a beat
+later — so a round landing inside that lag still creates one, and the trim collects it
+moments later. The hold narrows the window; it does not seal it. The "handed over but the
+target survived" case recovers through the same arithmetic, one settling later: if
+`replicas` rose at the moment of hand-over, the surplus is absorbed by the increase, the
+Deployment returns to spec, and the next round sees the set one short and refills it.
+
+**When a target goes away, the set shrinks with it.** Cancellation, a ReplicaSet pruned by a
 rollout, a deleted Deployment, a lowered `replicas`, an evicted target — all of it is covered
-by that single line. Nothing needs handling on its own.
+by the count. Nothing needs handling on its own.
 
 **Terminating targets are excluded from creation.** A ReplicaSet drops Pods with a
 `deletionTimestamp` from its active count, so it is already making its own replacement, and
@@ -186,8 +225,9 @@ anything.
 
 **Dead replacements are not counted, and are deleted.** A Pod that went `Failed` through node
 pressure eviction or a kubelet admission rejection can neither become Ready nor be adopted.
-Counting it as alive stalls that target forever. There is no restart for a Pod — phase `Failed`
-is terminal and `restartPolicy` is about containers — so recovery means a new Pod; and if the
+Counting it as alive stalls that slot of the set forever. There is no restart for a Pod —
+phase `Failed` is terminal and `restartPolicy` is about containers — so recovery means a new
+Pod; and if the
 dead one is neither counted nor deleted, corpses pile up with every attempt. While the cause
 persists this cycles through create-die-delete, and it converges the moment the cause clears.
 
@@ -216,25 +256,29 @@ Deployment's `spec.template` against the target ReplicaSet's template, ignoring 
 change, a `rollout restart`, every case where the template changes is caught the same way. The
 exception is `spec.paused`: with a paused Deployment the rule does not apply even if the
 templates differ, because the rollout is not actually moving and the premise of "already being
-replaced" breaks. Replacements are maintained as usual and only hand-over is held back by
-Healthy(D), until the rollout resumes and this rule catches it.
+replaced" breaks. Replacements already present are kept and only hand-over is held back by
+Healthy(D), until the rollout resumes and this rule catches it. Creation during the pause
+defers to the hold above: a rollout paused mid-surge keeps reporting more Pods than it wants,
+so nothing new is built — a Pod built then would only be deleted by this very rule the moment
+the rollout resumes.
 
-**If either deletion is rejected by its preconditions, the round ends.** A rejection means the
-Pod changed between the decision and the deletion. Rather than carry a stale list into
-hand-over, the round ends with a short requeue and the next round decides everything again from
-the current state. That is why hand-over does not need to re-check for replacements seated on a
-draining node.
+**If the landing or rollout deletion is rejected by its preconditions, the round ends.** A
+rejection means the Pod changed between the decision and the deletion. Rather than carry a
+stale list into hand-over, the round ends with a short requeue and the next round decides
+everything again from the current state. That is why hand-over does not need to re-check for
+replacements seated on a draining node. A rejected trim is milder: the changed Pod merely
+drops out of the round's list — it is not handed over, and the next round re-counts it.
 
-**Pods already handed over are not counted.** The `soft-drain.com/replaces` label is removed as
-part of the hand-over, so they are not candidates to begin with. This is what makes the
-"handed over but the target survived" case recover on its own: if `replicas` goes up at the
-moment of hand-over, the surplus is absorbed by the increase and nothing is deleted — and the
-next round sees "the target is still there and nothing stands in for it" and creates one more.
+**Pods already handed over are not counted.** The `soft-drain.com/replaces` label is removed
+as part of the hand-over, and an adopted Pod has a controller ownerRef besides, so they are
+not candidates to begin with.
 
 **Both the creating and the deleting side must be able to wake us.** With only the traversal
 that starts from the node, a pruned ReplicaSet takes the target Pods with it, leaving nothing
 to traverse and no reason to ever look at the replacements again. So there is a separate path
-keyed on the replacement Pod itself. The decision is the same single rule above.
+keyed on the replacement Pod itself. The decision is the same single rule above: it counts
+the ReplicaSet's live targets and its replacements, keeps the oldest up to the count, and
+deletes the rest.
 
 A replacement is built like this.
 
@@ -243,7 +287,7 @@ metadata:
   generateName: aaa-5449d4d8c8-        # the target's ReplicaSet name + "-"
   labels:
     app: aaa                            # from rs.spec.template.metadata.labels
-    soft-drain.com/replaces: 3f2a...     # the target Pod's UID
+    soft-drain.com/replaces: 3f2a...     # the target ReplicaSet's UID
     # pod-template-hash is removed
 spec: <rs.spec.template.spec verbatim>
 ```
@@ -262,11 +306,16 @@ to see from outside. A rejection does not stop anything; the next round tries ag
 ### Step 4. The hand-over
 
 Once a replacement is Ready, a single patch adds `pod-template-hash` and removes
-`soft-drain.com/replaces`.
+`soft-drain.com/replaces`. The members of a set are interchangeable, so any Ready one goes.
 
-The hash is read **from the ReplicaSet the target Pod's ownerRef points at**. The route through
-the Deployment to the current ReplicaSet is not used — the replacement was built from the
-target's ReplicaSet template, and during a rollout that may not be the current one.
+The hash is read **from the ReplicaSet the `replaces` label names**. The route through the
+Deployment to the current ReplicaSet is not used — the replacement was built from that
+ReplicaSet's template, and during a rollout that may not be the current one.
+
+**Never hand over more than the count.** Step 3's trim has already capped the set at the
+number of live targets, so handing over every Ready member cannot push the ReplicaSet further
+over `replicas` than it has targets to lose. One adoption beyond that would make it delete an
+innocent Pod at cost 0.
 
 One thing is checked before handing over. Replacements seated on a draining node were already
 deleted in step 3, so they never get here.
@@ -320,7 +369,7 @@ is the reason they are excluded from creation but counted for completion.
 | Node | `soft-drain.com/state` (label) | `InProgress` / `Complete` / `Cancelled` | controller |
 | Node | `soft-drain.com/cordoned-by-controller` (annotation) | `"true"` | controller |
 | Target Pod | `controller.kubernetes.io/pod-deletion-cost` (annotation) | `-2147483648` | controller |
-| Replacement Pod | `soft-drain.com/replaces` (label) | the target Pod's UID | controller |
+| Replacement Pod | `soft-drain.com/replaces` (label) | the target ReplicaSet's UID | controller |
 
 Nothing but soft-drain writes `soft-drain.com/replaces`. A Pod without that label is neither
 created nor deleted by us.
@@ -363,9 +412,11 @@ The scheduler writes the reason verbatim into the message of `PodScheduled=False
 like `0/12 nodes are available: 5 Insufficient cpu, 7 node(s) didn't match pod anti-affinity
 rules`. That is why the controller does not produce a diagnosis of its own.
 
-If no replacement is there at all, either the creation was rejected (ResourceQuota, admission
-webhook) or a rollout is performing the migration instead, so none is created. Either way it is
-in the Events of `kubectl describe node <node>`.
+If no replacement is there at all: the creation was rejected (ResourceQuota, admission
+webhook), a rollout is performing the migration instead, or creation is holding while the
+Deployment reports more Pods than it wants (step 3). The first two leave Events on
+`kubectl describe node <node>`; the hold leaves none, but `kubectl get deploy` shows the
+surplus — normally a window of seconds, for a rollout paused mid-surge as long as the pause.
 
 ## Known limitations
 

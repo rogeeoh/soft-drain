@@ -43,10 +43,16 @@ type NodeReconciler struct {
 	Recorder events.EventRecorder
 }
 
-// target is a Pod on the node whose owner is a ReplicaSet whose owner is a Deployment.
+// target is a Pod on a draining node whose owner is a ReplicaSet whose owner is a Deployment.
 type target struct {
 	pod *corev1.Pod
 	rs  *appsv1.ReplicaSet
+}
+
+// rsGroup is one ReplicaSet's shared replacement set (DESIGN.md step 3).
+type rsGroup struct {
+	rs   *appsv1.ReplicaSet
+	live int // targets without a deletionTimestamp, across every counted draining node
 }
 
 // +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list;watch;update;patch
@@ -173,7 +179,8 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 		log.Info("Cordoned node", "node", node.Name)
 	}
 
-	targets, err := r.collectTargets(ctx, node)
+	rsCache := map[types.NamespacedName]*appsv1.ReplicaSet{}
+	targets, err := r.collectTargets(ctx, node.Name, rsCache)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -192,15 +199,24 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 		}
 	}
 
-	if err := r.markTargets(ctx, targets); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	replsByUID, err := r.collectReplacements(ctx)
+	// step 3 counts a ReplicaSet's targets across every draining node, so the other
+	// counted nodes' targets join the same round (and are marked the same way).
+	others, err := r.collectOtherTargets(ctx, node, rsCache)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	retry, err := r.reconcileReplacements(ctx, node, targets, replsByUID)
+	all := append(targets, others...)
+
+	if err := r.markTargets(ctx, all); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	groups := groupTargets(all)
+	replsByRS, err := r.collectReplacements(ctx)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	retry, err := r.reconcileReplacements(ctx, node, groups, replsByRS)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -209,7 +225,7 @@ func (r *NodeReconciler) drain(ctx context.Context, node *corev1.Node) (ctrl.Res
 		// list into hand-over, end the round. The next round decides again from scratch.
 		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
-	if err := r.handOver(ctx, node, targets, replsByUID); err != nil {
+	if err := r.handOver(ctx, node, groups, replsByRS); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -252,26 +268,22 @@ func (r *NodeReconciler) markTargets(ctx context.Context, targets []target) erro
 	return nil
 }
 
-// reconcileReplacements matches the set that should exist against the set that does
-// (DESIGN.md step 3). Too few, create; a surplus on the same target, delete. Replacements
-// seated on a draining node or superseded by a rollout are deleted here too — neither can
-// reach adoption. If such a deletion is rejected by its preconditions, a retry ends the
-// round, keeping a stale list out of hand-over so the next round decides from fresh state.
-func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1.Node, targets []target, replsByUID map[string][]*corev1.Pod) (retry bool, err error) {
+// reconcileReplacements matches, per ReplicaSet, the set that should exist against the
+// set that does (DESIGN.md step 3). Too few, create; too many, delete the youngest first.
+// Replacements seated on a draining node or superseded by a rollout are deleted here too —
+// neither can reach adoption. If such a deletion is rejected by its preconditions, a retry
+// ends the round, keeping a stale list out of hand-over so the next round decides from
+// fresh state; a rejected trim only drops that Pod from the round's list.
+func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1.Node, groups []*rsGroup, replsByRS map[string][]*corev1.Pod) (retry bool, err error) {
 	log := logf.FromContext(ctx)
 	drainingNodes := map[string]bool{node.Name: true}
 	deploys := map[types.NamespacedName]*appsv1.Deployment{}
-	for _, t := range targets {
-		// A terminating target already has the ReplicaSet making its own replacement.
-		// Any replacement left over is deleted by the reclamation path (PodReconciler), same rule.
-		if t.pod.DeletionTimestamp != nil {
-			continue
-		}
-		uid := string(t.pod.UID)
+	for _, g := range groups {
+		uid := string(g.rs.UID)
 
 		// A replacement seated on a draining node is deleted regardless of readiness.
 		var kept []*corev1.Pod
-		for _, repl := range replsByUID[uid] {
+		for _, repl := range replsByRS[uid] {
 			landed, err := r.nodeDraining(ctx, drainingNodes, repl.Spec.NodeName)
 			if err != nil {
 				return false, err
@@ -294,11 +306,11 @@ func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1
 			log.Info("Deleted replacement Pod that landed on draining node",
 				"pod", repl.Namespace+"/"+repl.Name, "landedOn", repl.Spec.NodeName, "node", node.Name)
 		}
-		replsByUID[uid] = kept
+		replsByRS[uid] = kept
 
-		// If a rollout is performing the target's migration instead, delete the replacement
+		// If a rollout is performing the targets' migration instead, delete the replacements
 		// and create none until the generation comes back.
-		superseded, err := r.supersededByRollout(ctx, deploys, t.rs)
+		superseded, err := r.supersededByRollout(ctx, deploys, g.rs)
 		if err != nil {
 			return false, err
 		}
@@ -316,96 +328,106 @@ func (r *NodeReconciler) reconcileReplacements(ctx context.Context, node *corev1
 					"Deleted replacement Pod %s/%s superseded by a rollout of its Deployment",
 					repl.Namespace, repl.Name)
 				log.Info("Deleted replacement Pod superseded by a rollout",
-					"pod", repl.Namespace+"/"+repl.Name, "target", t.pod.Namespace+"/"+t.pod.Name, "node", node.Name)
+					"pod", repl.Namespace+"/"+repl.Name, "replicaset", g.rs.Namespace+"/"+g.rs.Name, "node", node.Name)
 			}
-			replsByUID[uid] = nil
+			replsByRS[uid] = nil
 			continue
 		}
 
 		switch {
-		case len(kept) == 0:
-			repl := buildReplacement(t.rs, t.pod.UID)
-			if err := r.Create(ctx, repl); err != nil {
-				r.Recorder.Eventf(node, nil, corev1.EventTypeWarning, "ReplacementCreateRejected",
-					"CreateReplacementPod",
-					"Failed to create replacement Pod for %s/%s: %v", t.pod.Namespace, t.pod.Name, err)
-				log.Error(err, "Failed to create replacement Pod",
-					"target", t.pod.Namespace+"/"+t.pod.Name, "node", node.Name)
-				continue
-			}
-			log.Info("Created replacement Pod",
-				"pod", repl.Namespace+"/"+repl.Name, "target", t.pod.Namespace+"/"+t.pod.Name, "node", node.Name)
-		case len(kept) > 1:
-			// Keep only the oldest one. The trim exists so this round's hand-over does not
-			// look again at a Pod it just deleted.
-			for _, extra := range kept[1:] {
-				if _, err := deleteReplacement(ctx, r.Client, extra); err != nil {
+		case len(kept) > g.live:
+			// The set shrinks from the end with the least readiness work. kept is sorted
+			// oldest first, so the tail is the youngest.
+			for _, extra := range kept[g.live:] {
+				deleted, err := deleteReplacement(ctx, r.Client, extra)
+				if err != nil {
 					return false, err
 				}
+				if deleted {
+					log.Info("Deleted surplus replacement Pod",
+						"pod", extra.Namespace+"/"+extra.Name, "replicaset", g.rs.Namespace+"/"+g.rs.Name, "node", node.Name)
+				}
 			}
-			replsByUID[uid] = kept[:1]
+			replsByRS[uid] = kept[:g.live]
+		case len(kept) < g.live:
+			// While the Deployment reports more Pods than it wants, a deletion is owed and
+			// the targets are first in line — a Pod created now would only meet the trim.
+			if key, ok := deploymentKey(g.rs); ok && deploymentOverReplicas(deploys[key]) {
+				continue
+			}
+			for i := len(kept); i < g.live; i++ {
+				repl := buildReplacement(g.rs)
+				if err := r.Create(ctx, repl); err != nil {
+					r.Recorder.Eventf(node, nil, corev1.EventTypeWarning, "ReplacementCreateRejected",
+						"CreateReplacementPod",
+						"Failed to create replacement Pod for ReplicaSet %s/%s: %v", g.rs.Namespace, g.rs.Name, err)
+					log.Error(err, "Failed to create replacement Pod",
+						"replicaset", g.rs.Namespace+"/"+g.rs.Name, "node", node.Name)
+					break
+				}
+				log.Info("Created replacement Pod",
+					"pod", repl.Namespace+"/"+repl.Name, "replicaset", g.rs.Namespace+"/"+g.rs.Name, "node", node.Name)
+			}
 		}
 	}
 	return false, nil
 }
 
-// handOver attaches the hash to a Ready replacement so the ReplicaSet takes it (DESIGN.md step 4).
+// handOver attaches the hash to Ready replacements so the ReplicaSet takes them
+// (DESIGN.md step 4). The members of a set are interchangeable, so any Ready one goes;
+// reconcileReplacements already capped the set at the live target count, so handing over
+// every Ready member cannot overshoot what the ReplicaSet has targets to lose.
 // The decision is per Deployment, and whichever is ready hands over first.
-func (r *NodeReconciler) handOver(ctx context.Context, node *corev1.Node, targets []target, replsByUID map[string][]*corev1.Pod) error {
+func (r *NodeReconciler) handOver(ctx context.Context, node *corev1.Node, groups []*rsGroup, replsByRS map[string][]*corev1.Pod) error {
 	log := logf.FromContext(ctx)
 	healthyDeploys := map[types.NamespacedName]bool{}
-	for _, t := range targets {
-		if t.pod.DeletionTimestamp != nil {
+	for _, g := range groups {
+		if g.live == 0 {
 			continue
 		}
-		// replacements seated on a draining node were already deleted by reconcileReplacements
-		existing := replsByUID[string(t.pod.UID)]
-		if len(existing) == 0 {
-			continue
-		}
-		repl := existing[0]
-		if !podReady(repl) {
-			continue
-		}
-
-		healthy, err := r.deployHealthy(ctx, healthyDeploys, t.rs)
-		if err != nil {
-			return err
-		}
-		if !healthy {
-			continue
-		}
-
-		// The hash is read from the target's ReplicaSet; during a rollout that may not be the current RS.
-		hash := t.rs.Labels[LabelPodTemplateHash]
+		// The hash is read from the ReplicaSet the replaces label names; during a rollout
+		// that may not be the current RS.
+		hash := g.rs.Labels[LabelPodTemplateHash]
 		if hash == "" {
 			// An RS created by a Deployment always has the hash label. Reaching here is abnormal, so leave a trace.
 			log.Info("Skipped handover because ReplicaSet has no pod-template-hash label",
-				"replicaset", t.rs.Namespace+"/"+t.rs.Name, "target", t.pod.Namespace+"/"+t.pod.Name)
+				"replicaset", g.rs.Namespace+"/"+g.rs.Name)
 			continue
 		}
-		// One patch attaches the hash and removes replaces. Ownership passes to the ReplicaSet here.
-		patch := mergePatch(map[string]any{
-			"metadata": map[string]any{"labels": map[string]any{
-				LabelPodTemplateHash: hash,
-				LabelReplaces:        nil,
-			}},
-		})
-		if err := r.Patch(ctx, repl, patch); err != nil && !apierrors.IsNotFound(err) {
-			return err
+		// replacements seated on a draining node were already deleted by reconcileReplacements
+		for _, repl := range replsByRS[string(g.rs.UID)] {
+			if !podReady(repl) {
+				continue
+			}
+			healthy, err := r.deployHealthy(ctx, healthyDeploys, g.rs)
+			if err != nil {
+				return err
+			}
+			if !healthy {
+				break
+			}
+			// One patch attaches the hash and removes replaces. Ownership passes to the ReplicaSet here.
+			patch := mergePatch(map[string]any{
+				"metadata": map[string]any{"labels": map[string]any{
+					LabelPodTemplateHash: hash,
+					LabelReplaces:        nil,
+				}},
+			})
+			if err := r.Patch(ctx, repl, patch); err != nil && !apierrors.IsNotFound(err) {
+				return err
+			}
+			log.Info("Handed replacement Pod over to ReplicaSet",
+				"pod", repl.Namespace+"/"+repl.Name, "replicaset", g.rs.Namespace+"/"+g.rs.Name, "node", node.Name)
 		}
-		log.Info("Handed replacement Pod over to ReplicaSet",
-			"pod", repl.Namespace+"/"+repl.Name, "target", t.pod.Namespace+"/"+t.pod.Name, "node", node.Name)
 	}
 	return nil
 }
 
-func (r *NodeReconciler) collectTargets(ctx context.Context, node *corev1.Node) ([]target, error) {
+func (r *NodeReconciler) collectTargets(ctx context.Context, nodeName string, rsCache map[types.NamespacedName]*appsv1.ReplicaSet) ([]target, error) {
 	pods := &corev1.PodList{}
-	if err := r.Reader.List(ctx, pods, client.MatchingFields{"spec.nodeName": node.Name}); err != nil {
+	if err := r.Reader.List(ctx, pods, client.MatchingFields{"spec.nodeName": nodeName}); err != nil {
 		return nil, err
 	}
-	rsCache := map[types.NamespacedName]*appsv1.ReplicaSet{}
 	var targets []target
 	for i := range pods.Items {
 		pod := &pods.Items[i]
@@ -428,12 +450,57 @@ func (r *NodeReconciler) collectTargets(ctx context.Context, node *corev1.Node) 
 			}
 			rsCache[key] = rs
 		}
-		if !ownedByDeployment(rs) {
+		// A same-name ReplicaSet recreated in between is a different owner — the UID the
+		// ownerRef names is the one that counts (the Pod path matches by UID too).
+		if rs.UID != ref.UID || !ownedByDeployment(rs) {
 			continue
 		}
 		targets = append(targets, target{pod: pod, rs: rs})
 	}
 	return targets, nil
+}
+
+// collectOtherTargets gathers the targets of every other counted draining node, so the
+// round reconciles each ReplicaSet's one shared set (DESIGN.md step 3).
+func (r *NodeReconciler) collectOtherTargets(ctx context.Context, self *corev1.Node, rsCache map[types.NamespacedName]*appsv1.ReplicaSet) ([]target, error) {
+	nodes := &corev1.NodeList{}
+	if err := r.Reader.List(ctx, nodes, client.MatchingLabels{LabelDrain: "true"}); err != nil {
+		return nil, err
+	}
+	var others []target
+	for i := range nodes.Items {
+		n := &nodes.Items[i]
+		if n.Name == self.Name || !drainCounting(n) {
+			continue
+		}
+		ts, err := r.collectTargets(ctx, n.Name, rsCache)
+		if err != nil {
+			return nil, err
+		}
+		others = append(others, ts...)
+	}
+	return others, nil
+}
+
+// groupTargets folds targets into per-ReplicaSet sets. The shared rsCache makes the same
+// ReplicaSet one pointer across nodes, and first-seen order keeps the round deterministic.
+func groupTargets(targets []target) []*rsGroup {
+	byUID := map[types.UID]*rsGroup{}
+	var groups []*rsGroup
+	for _, t := range targets {
+		g, ok := byUID[t.rs.UID]
+		if !ok {
+			g = &rsGroup{rs: t.rs}
+			byUID[t.rs.UID] = g
+			groups = append(groups, g)
+		}
+		// A terminating target already has the ReplicaSet making its own replacement,
+		// so it does not raise the count.
+		if t.pod.DeletionTimestamp == nil {
+			g.live++
+		}
+	}
+	return groups
 }
 
 func (r *NodeReconciler) collectReplacements(ctx context.Context) (map[string][]*corev1.Pod, error) {
@@ -476,15 +543,23 @@ func (r *NodeReconciler) nodeDraining(ctx context.Context, cache map[string]bool
 	return cache[name], nil
 }
 
-// supersededByRollout reports whether a rollout is performing the target's migration (DESIGN.md step 3).
-// A paused rollout does not actually move, so it does not apply even if the templates differ.
-func (r *NodeReconciler) supersededByRollout(ctx context.Context, cache map[types.NamespacedName]*appsv1.Deployment, rs *appsv1.ReplicaSet) (bool, error) {
+// deploymentKey returns the cache key of the Deployment owning rs.
+func deploymentKey(rs *appsv1.ReplicaSet) (types.NamespacedName, bool) {
 	ref := metav1.GetControllerOf(rs)
 	if ref == nil {
+		return types.NamespacedName{}, false
+	}
+	return types.NamespacedName{Namespace: rs.Namespace, Name: ref.Name}, true
+}
+
+// supersededByRollout reports whether a rollout is performing the targets' migration (DESIGN.md step 3).
+// A paused rollout does not actually move, so it does not apply even if the templates differ.
+func (r *NodeReconciler) supersededByRollout(ctx context.Context, cache map[types.NamespacedName]*appsv1.Deployment, rs *appsv1.ReplicaSet) (bool, error) {
+	key, ok := deploymentKey(rs)
+	if !ok {
 		// unreachable: collectTargets only passes RSes that cleared ownedByDeployment
 		return false, nil
 	}
-	key := types.NamespacedName{Namespace: rs.Namespace, Name: ref.Name}
 	d, ok := cache[key]
 	if !ok {
 		d = &appsv1.Deployment{}

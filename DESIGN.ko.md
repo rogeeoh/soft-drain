@@ -23,7 +23,7 @@ soft-drain은 이 둘을 이어 붙인다. 옮길 Pod과 똑같은 Pod을 하나
 
 `pod-template-hash`는 ReplicaSet selector에는 들어가고 Service selector에는 안 들어간다. 그래서 대체 Pod은 Ready가 되는 즉시 Endpoints에 올라가고 입양 전후로 빠지지 않는다. 엔드포인트 갱신이 Pod당 한 번뿐이다.
 
-**보장하는 것은 노출이지 어느 Pod이 지워지는가가 아니다.** `pod-deletion-cost`는 삭제 정렬의 4순위 힌트다. 넘기는 순간 무관한 Pod이 NotReady면 ReplicaSet은 그쪽을 지우고 우리 타깃은 남는다. 그래도 Ready인 Pod을 먼저 늘린 다음 초과분이 지워지므로 노출은 `N` 밑으로 내려가지 않고, 남은 타깃은 다음 라운드에 다시 시도된다.
+**보장하는 것은 노출이지 어느 Pod이 지워지는가가 아니다.** `pod-deletion-cost`는 삭제 정렬의 4순위 힌트다. 타깃은 전부 같은 값을 달고 있어서 그중 누구를 지울지는 ReplicaSet의 후순위 기준이 정하고, 넘기는 순간 무관한 Pod이 NotReady면 그쪽이 지워져 타깃은 전부 남는다. 그래도 Ready인 Pod을 먼저 늘린 다음 초과분이 지워지므로 노출은 `N` 밑으로 내려가지 않는다. 그리고 대체 Pod을 특정 Pod에 짝짓지 않고 ReplicaSet 단위로 유지하므로(3번) 누가 지워지든 상관없다 — 타깃 중 하나가 죽으면 그걸로 셈이 맞고, 타깃을 다 비껴가면 집합이 하나 모자라져 다음 라운드가 채운다.
 
 ## 쓰는 법
 
@@ -49,7 +49,7 @@ kubectl soft-drain release node-01 [...]   # 라벨을 걷고 복원을 기다�
 
 release는 진행 중이면 취소가 되고 Complete면 관리 종료가 된다 — 실체는 같은 라벨 제거고, 결말도 같다: 우리가 남긴 것을 전부 걷는다(우리가 걸었던 cordon 포함). 그래서 release는 정비가 끝난 뒤의 동사다 — 리부팅 전에 하면 비워 둔 노드가 도로 열린다. `kubectl uncordon`도 취소지만 라벨과 Cancelled 래치가 남는 점이 다르다 — release는 전부 걷는다. `--timeout`이 터지면 Pending 대체 Pod과 스케줄러 메시지를 보여주고 0이 아닌 코드로 나간다 — "막혔을 때 보는 법"의 자동화다. 중간에 끊어도 라벨은 남으므로 drain은 계속된다. `state=Cancelled`인 노드에 다시 drain을 걸면 라벨을 걷어 복원시킨 뒤 다시 붙인다.
 
-현황판에 "언제부터"는 없다 — 컨트롤러가 무기억이라 시작 시각을 어디에도 기록하지 않는다. `-o`의 몫은 플러그인만 계산할 수 있는 집계(타깃·대체 Pod 상태·스케줄러 메시지)다. 노드명 목록이 필요한 기계는 라벨 조회가 정석이다: `kubectl get nodes -l soft-drain.com/state=Complete -o name`.
+현황판에 "언제부터"는 없다 — 컨트롤러가 무기억이라 시작 시각을 어디에도 기록하지 않는다. `-o`의 몫은 플러그인만 계산할 수 있는 집계(타깃·대체 Pod 상태·스케줄러 메시지)다. 대체 Pod은 노드가 아니라 ReplicaSet 소속이므로(3번), 두 drain 노드가 ReplicaSet을 공유하면 그 집합은 양쪽 행에 다 보인다 — 양쪽을 함께 섬기기 때문이다. 노드명 목록이 필요한 기계는 라벨 조회가 정석이다: `kubectl get nodes -l soft-drain.com/state=Complete -o name`.
 
 `kubectl drain`의 `--ignore-daemonsets`, `--delete-emptydir-data`, `--force`는 없다. eviction 전제의 개념이라 여기 해당이 없다.
 
@@ -58,7 +58,7 @@ release는 진행 중이면 취소가 되고 Complete면 관리 종료가 된다
 ```
 1. drain 라벨이 붙은 노드를 cordon한다
 2. 그 노드의 Deployment Pod(타깃)에 pod-deletion-cost 를 음수로 박는다
-3. 타깃마다 대체 Pod이 하나씩 있도록 맞춘다
+3. ReplicaSet마다 타깃 수만큼 대체 Pod이 있도록 맞춘다
 4. 대체 Pod이 Ready가 되면 pod-template-hash 를 붙여 ReplicaSet이 데려가게 한다
 5. 타깃이 없어질 때까지 반복한다
 6. 타깃이 없으면 완료 표시를 한다
@@ -92,35 +92,44 @@ release는 진행 중이면 취소가 되고 Complete면 관리 종료가 된다
 
 ### 3. 대체 Pod 맞추기
 
-만들기만 하는 단계가 아니다. **있어야 할 집합과 있는 집합을 맞춘다.**
+만들기만 하는 단계가 아니다. **ReplicaSet마다, 있어야 할 집합과 있는 집합을 맞춘다.**
 
 ```
-있어야 할 것 = deletionTimestamp 가 없는 타깃마다 하나
-있는 것      = soft-drain.com/replaces = <타깃 UID> 이면서
+있어야 할 것 = 그 ReplicaSet의 타깃 중 deletionTimestamp 가 없는 것마다 하나
+               (drain 중인 모든 노드에 걸쳐 센다)
+있는 것      = soft-drain.com/replaces = <그 ReplicaSet의 UID> 이면서
                controller ownerRef 없고
                phase 가 Failed / Succeeded 가 아니고
                deletionTimestamp 도 없는 Pod
 
-모자라면 만들고, 남으면 지운다
+모자라면 만들고, 남으면 어린 것부터 지운다
 ```
 
-**타깃이 사라지면 대체 Pod도 사라진다.** 취소, 롤아웃으로 인한 ReplicaSet prune, Deployment 삭제, `replicas` 축소, 타깃의 eviction이 전부 이 한 줄에 걸린다. 따로 처리할 것이 없다.
+**대체 Pod은 특정 Pod이 아니라 ReplicaSet을 대신한다.** ReplicaSet의 자식은 전부 같은 템플릿에서 나오므로 어느 대체든 어느 타깃의 자리든 메울 수 있다 — 그리고 지우는 쪽은 애초에 짝을 존중한 적이 없다. 타깃이 전부 같은 `pod-deletion-cost`를 달고 있으니 누구를 지울지는 ReplicaSet의 후순위 기준이 정한다. 짝 단위로 장부를 쓰면 그 선택이 "어긋남"이 되어 기동 중이던 대체를 버리고 살아남은 타깃 몫을 새로 지어야 하지만, ReplicaSet 단위로 세면 그 선택은 아무 일도 아니다. 어느 타깃이 죽든 필요한 수가 하나 줄고, 집합은 이미 맞아 있다.
+
+**집합은 drain 중인 모든 노드에 걸친다.** 대체 Pod에는 소속 노드가 없어서, ReplicaSet을 공유하는 두 drain은 집합도 공유한다 — 노드별로 따로 세면 두 배로 만든다. 그래서 라운드는 그 ReplicaSet의 타깃을 drain 중인 모든 노드에서 세고(2번의 마킹도 같이 한다 — 쓰기가 멱등이다) 공유 집합 하나를 맞춘다. `Complete` 노드는 래치가 걸려 늦게 온 Pod에 관여하지 않으므로 세지 않고, `Cancelled` 노드는 도로 평범한 노드다.
+
+**남는 것은 어린 것부터 지운다.** 집합은 언제나 준비에 들인 것이 가장 적은 끝에서부터 줄어든다. 10분째 데워지던 대체가 버려지는 일은 없고, 방금 만든 것이 버려진다.
+
+**Deployment가 원하는 것보다 Pod이 많다고 보고하는 동안은 만들지 않는다.** 넘긴 직후에는 입양된 Pod이 집합에서 빠지는데 — 이제 controller가 있다 — 밀려날 타깃은 아직 돌고 있어서 수가 하나 모자라 보이고, 몇 초 뒤 ReplicaSet의 삭제가 셈을 맞춘다. 그 창에서 만든 Pod은 어린 것부터 지우는 정리 말고는 갈 곳이 없다. `D.status.replicas > D.spec.replicas`가 그 창을 읽을 수 있게 해준다: 삭제가 이미 예약돼 있고, drain 노드의 Pod이 그 1순위이므로, 수가 spec으로 돌아올 때까지 그 Deployment 타깃의 생성은 보류한다. 다만 이 신호는 status를 거쳐 온다 — patch는 집합을 즉시 줄이는데 보고는 한 박자 늦게 따라오므로, 그 시차에 걸린 라운드는 여전히 하나를 만들고 정리가 곧 회수한다. 보류는 창을 좁히는 것이지 봉하는 것이 아니다. "넘겼는데 타깃이 살아남은" 경우도 같은 산술로, 한 박자 늦게 복구된다: 넘기는 순간 `replicas`가 올라갔다면 초과분이 증설분에 흡수되고, Deployment가 spec으로 돌아온 다음 라운드가 하나 모자란 집합을 채운다.
+
+**타깃이 사라지면 집합도 따라 준다.** 취소, 롤아웃으로 인한 ReplicaSet prune, Deployment 삭제, `replicas` 축소, 타깃의 eviction이 전부 이 셈에 걸린다. 따로 처리할 것이 없다.
 
 **terminating 타깃은 만들기에서 뺀다.** ReplicaSet은 `deletionTimestamp`가 찍힌 Pod을 active에서 빼므로 이미 스스로 대체를 만들고 있고, 노드가 cordon이라 그 Pod은 다른 노드에 뜬다. 자리는 우리가 아무것도 안 해도 비워진다.
 
-**죽은 대체 Pod은 있는 것으로 세지 않고, 지운다.** 노드 압력 eviction이나 kubelet admission 거부로 `Failed`가 된 Pod은 Ready가 될 수도 입양될 수도 없다. 살아 있는 것으로 세면 그 타깃이 영원히 멈춘다. Pod에는 재시작이 없어서(phase `Failed`는 터미널이고 `restartPolicy`는 컨테이너 얘기다) 복구는 새 Pod뿐인데, 세지 않고 지우지도 않으면 만들 때마다 시체가 쌓인다. 원인이 지속되면 만들고-죽고-지우기를 반복하다가 원인이 풀리는 순간 수렴한다.
+**죽은 대체 Pod은 있는 것으로 세지 않고, 지운다.** 노드 압력 eviction이나 kubelet admission 거부로 `Failed`가 된 Pod은 Ready가 될 수도 입양될 수도 없다. 살아 있는 것으로 세면 집합의 그 자리가 영원히 채워지지 않는다. Pod에는 재시작이 없어서(phase `Failed`는 터미널이고 `restartPolicy`는 컨테이너 얘기다) 복구는 새 Pod뿐인데, 세지 않고 지우지도 않으면 만들 때마다 시체가 쌓인다. 원인이 지속되면 만들고-죽고-지우기를 반복하다가 원인이 풀리는 순간 수렴한다.
 
 **drain 중인 노드에 앉은 대체 Pod도 세지 않고, 지운다.** cordon보다 스케줄이 먼저여서, 앉은 뒤에 그 노드에 drain이 걸리는 경우가 생긴다. Ready를 기다릴 이유가 없다 — Ready가 되어도 넘기면 비우려는 노드에 타깃이 하나 더 생길 뿐이라 결말은 삭제뿐이고, 그동안 자리만 먹는다. hash가 없어 어느 ReplicaSet의 자식도 아니므로 지워도 노출은 줄지 않고, 같은 라운드가 새로 만들면 스케줄러가 cordon을 피해 앉힌다. 지울 때 Warning Event를 남긴다.
 
 `node.kubernetes.io/unschedulable`을 tolerate하는 워크로드는 새로 만든 Pod이 또 drain 노드에 앉을 수 있고, 그러면 만들고 지우기를 반복한다. cordon을 무시하도록 만든 워크로드이므로 우리가 `nodeAffinity`를 주입해 그 의도를 뒤집지 않는다. 반복되는 Warning Event가 옮길 수 없다는 사실을 보여준다.
 
-**타깃의 ReplicaSet이 Deployment의 현재 템플릿이 아니면 만들지 않고, 있으면 지운다.** 롤아웃이 그 타깃을 이미 대체하는 중이다 — 새 버전을 다른 노드에 올리고 Ready 후 타깃을 지우는, 우리가 하려던 일 그대로다. 우리 대체 Pod은 낙선한 버전을 짓는 잉여이고, Healthy(D)가 롤아웃 내내 넘기기를 막으므로 입양에 도달할 수도 없다. `pod-deletion-cost`는 타깃에 남아 있으므로 old ReplicaSet의 스케일다운이 drain 노드의 타깃부터 지운다. 지울 때 Normal Event를 남긴다. 판정은 Deployment의 `spec.template`과 타깃 ReplicaSet의 템플릿을 `pod-template-hash` 라벨만 빼고 비교한다(Deployment 컨트롤러의 EqualIgnoreHash와 같다) — 이미지 변경이든 `rollout restart`든, 템플릿이 바뀌는 모든 경우가 같은 길로 잡힌다. 단 `spec.paused`면 템플릿이 달라도 이 규칙을 적용하지 않는다 — 롤아웃이 실제로 움직이지 않아 "대체 중"이라는 전제가 깨진다. 대체는 평소처럼 유지되고 넘기기만 Healthy(D)에 걸려 미뤄지다가, 재개되는 순간 이 규칙이 잡는다.
+**타깃의 ReplicaSet이 Deployment의 현재 템플릿이 아니면 만들지 않고, 있으면 지운다.** 롤아웃이 그 타깃을 이미 대체하는 중이다 — 새 버전을 다른 노드에 올리고 Ready 후 타깃을 지우는, 우리가 하려던 일 그대로다. 우리 대체 Pod은 낙선한 버전을 짓는 잉여이고, Healthy(D)가 롤아웃 내내 넘기기를 막으므로 입양에 도달할 수도 없다. `pod-deletion-cost`는 타깃에 남아 있으므로 old ReplicaSet의 스케일다운이 drain 노드의 타깃부터 지운다. 지울 때 Normal Event를 남긴다. 판정은 Deployment의 `spec.template`과 타깃 ReplicaSet의 템플릿을 `pod-template-hash` 라벨만 빼고 비교한다(Deployment 컨트롤러의 EqualIgnoreHash와 같다) — 이미지 변경이든 `rollout restart`든, 템플릿이 바뀌는 모든 경우가 같은 길로 잡힌다. 단 `spec.paused`면 템플릿이 달라도 이 규칙을 적용하지 않는다 — 롤아웃이 실제로 움직이지 않아 "대체 중"이라는 전제가 깨진다. 있던 대체는 유지되고 넘기기만 Healthy(D)에 걸려 미뤄지다가, 재개되는 순간 이 규칙이 잡는다. 멈춰 있는 동안의 생성은 위의 보류가 우선한다: 롤아웃 중간에 멈춘 Deployment는 초과 보고가 지속되므로 새로 짓지 않는데, 그때 지은 Pod은 재개되는 순간 바로 이 규칙이 지울 것이기 때문이다.
 
-**두 삭제가 preconditions에 거부되면 라운드를 접는다.** 거부는 판정과 삭제 사이에 Pod이 변했다는 뜻이다. 낡은 명단으로 넘기기까지 진행하지 않고 짧은 requeue로 라운드를 끝내, 다음 라운드가 새 상태에서 처음부터 판정한다. 그래서 넘기기는 "drain 중인 노드에 앉은 대체"를 다시 검사할 필요가 없다.
+**착지 삭제와 롤아웃 삭제가 preconditions에 거부되면 라운드를 접는다.** 거부는 판정과 삭제 사이에 Pod이 변했다는 뜻이다. 낡은 명단으로 넘기기까지 진행하지 않고 짧은 requeue로 라운드를 끝내, 다음 라운드가 새 상태에서 처음부터 판정한다. 그래서 넘기기는 "drain 중인 노드에 앉은 대체"를 다시 검사할 필요가 없다. 정리 삭제의 거부는 더 가볍다 — 변한 Pod이 이번 라운드 명단에서 빠질 뿐이고, 넘기지 않으며, 다음 라운드가 다시 센다.
 
-**이미 넘긴 것도 세지 않는다.** 넘기면서 `soft-drain.com/replaces` 라벨을 떼기 때문에 애초에 후보가 아니다. 그래서 넘겼는데 타깃이 살아남은 경우가 자연히 복구된다 — 넘기는 순간 `replicas`가 올라가면 초과분이 증설분에 흡수되어 아무것도 안 지워지는데, 다음 라운드가 "타깃은 그대로인데 대신할 Pod이 없다"를 보고 하나 더 만든다.
+**이미 넘긴 것도 세지 않는다.** 넘기면서 `soft-drain.com/replaces` 라벨을 떼고, 입양된 Pod에는 controller ownerRef도 있어서 애초에 후보가 아니다.
 
-**만드는 쪽과 지우는 쪽 양쪽에서 깨어나야 한다.** 노드에서 출발하는 순회만 있으면, ReplicaSet이 prune될 때 타깃 Pod도 같이 사라져서 순회할 대상이 없어지고 대체 Pod을 쳐다볼 일이 없어진다. 그래서 대체 Pod 자체를 키로 하는 경로가 따로 있어야 한다. 판정은 위 한 줄로 같다.
+**만드는 쪽과 지우는 쪽 양쪽에서 깨어나야 한다.** 노드에서 출발하는 순회만 있으면, ReplicaSet이 prune될 때 타깃 Pod도 같이 사라져서 순회할 대상이 없어지고 대체 Pod을 쳐다볼 일이 없어진다. 그래서 대체 Pod 자체를 키로 하는 경로가 따로 있어야 한다. 판정은 위 한 줄로 같다 — 그 ReplicaSet의 살아 있는 타깃과 대체를 세서, 오래된 것부터 그 수만큼 남기고 나머지를 지운다.
 
 대체 Pod은 이렇게 만든다.
 
@@ -129,7 +138,7 @@ metadata:
   generateName: aaa-5449d4d8c8-        # 타깃의 ReplicaSet 이름 + "-"
   labels:
     app: aaa                            # rs.spec.template.metadata.labels 에서
-    soft-drain.com/replaces: 3f2a...     # 타깃 Pod의 UID
+    soft-drain.com/replaces: 3f2a...     # 타깃 ReplicaSet의 UID
     # pod-template-hash 는 뺀다
 spec: <rs.spec.template.spec 그대로>
 ```
@@ -142,9 +151,11 @@ spec: <rs.spec.template.spec 그대로>
 
 ### 4. 넘기기
 
-대체 Pod이 Ready가 되면 patch 하나로 `pod-template-hash`를 붙이고 `soft-drain.com/replaces`를 뗀다.
+대체 Pod이 Ready가 되면 patch 하나로 `pod-template-hash`를 붙이고 `soft-drain.com/replaces`를 뗀다. 집합의 구성원은 서로 대체 가능하므로 Ready인 것이면 어느 것이든 넘어간다.
 
-붙일 hash는 **타깃 Pod의 ownerRef가 가리키는 ReplicaSet**에서 읽는다. Deployment를 거쳐 현재 ReplicaSet을 찾는 경로는 쓰지 않는다 — 대체 Pod은 타깃의 ReplicaSet 템플릿으로 만들어졌고, 롤아웃 중이면 그게 현재 ReplicaSet이 아닐 수 있다.
+붙일 hash는 **`replaces` 라벨이 가리키는 ReplicaSet**에서 읽는다. Deployment를 거쳐 현재 ReplicaSet을 찾는 경로는 쓰지 않는다 — 대체 Pod은 그 ReplicaSet의 템플릿으로 만들어졌고, 롤아웃 중이면 그게 현재 ReplicaSet이 아닐 수 있다.
+
+**수보다 많이 넘기지 않는다.** 3번의 정리가 집합을 이미 살아 있는 타깃 수 이하로 잘라 두었으므로, Ready인 구성원을 전부 넘겨도 ReplicaSet이 잃을 타깃 수보다 더 초과되지는 않는다. 그보다 하나라도 더 입양시키면 cost 0짜리 무고한 Pod이 지워진다.
 
 넘기기 전에 하나를 본다. drain 중인 노드에 앉은 대체는 3단계가 이미 지웠으므로 여기 오지 않는다.
 
@@ -178,7 +189,7 @@ Healthy가 아니면 미룬다. 사용자가 `N` 미만이면 넘겨도 초과�
 | 노드 | `soft-drain.com/state` (라벨) | `InProgress` / `Complete` / `Cancelled` | 컨트롤러 |
 | 노드 | `soft-drain.com/cordoned-by-controller` (어노테이션) | `"true"` | 컨트롤러 |
 | 타깃 Pod | `controller.kubernetes.io/pod-deletion-cost` (어노테이션) | `-2147483648` | 컨트롤러 |
-| 대체 Pod | `soft-drain.com/replaces` (라벨) | 타깃 Pod의 UID | 컨트롤러 |
+| 대체 Pod | `soft-drain.com/replaces` (라벨) | 타깃 ReplicaSet의 UID | 컨트롤러 |
 
 `soft-drain.com/replaces`를 쓰는 것은 우리뿐이다. 이 라벨이 없는 Pod은 만들지도 지우지도 않는다.
 
@@ -211,7 +222,7 @@ kubectl describe pod <Pending 인 것>
 
 스케줄러가 `PodScheduled=False`의 message에 이유를 그대로 써 둔다 — `0/12 nodes are available: 5 Insufficient cpu, 7 node(s) didn't match pod anti-affinity rules` 같은 식이다. 컨트롤러가 따로 진단을 만들지 않는 이유다.
 
-대체 Pod이 하나도 안 보이면 생성이 거부됐거나(ResourceQuota, admission webhook), 롤아웃이 이주를 대신 수행 중이라 만들지 않는 것이다. 어느 쪽이든 `kubectl describe node <노드>`의 Event에 남는다.
+대체 Pod이 하나도 안 보이면 셋 중 하나다: 생성이 거부됐거나(ResourceQuota, admission webhook), 롤아웃이 이주를 대신 수행 중이거나, Deployment가 원하는 것보다 Pod이 많다고 보고해 생성이 보류 중이다(3번). 앞의 둘은 `kubectl describe node <노드>`의 Event에 남고, 보류는 Event를 남기지 않는 대신 `kubectl get deploy`에 초과분이 보인다 — 보통은 몇 초짜리 창이고, 롤아웃 중간에 멈춘 Deployment라면 pause가 풀릴 때까지다.
 
 ## 알려진 한계
 
