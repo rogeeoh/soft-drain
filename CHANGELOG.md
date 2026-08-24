@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/rogeeoh/soft-drain/compare/v0.3.0...v0.4.0) (2026-08-24)
+
+
+### Features
+
+* replace per-target pairing with a ReplicaSet-scoped replacement set ([ff59bae](https://github.com/rogeeoh/soft-drain/commit/ff59bae88c88493ccffdd5b8dd10c14c2bca1da4))
+
 ## [0.3.0](https://github.com/rogeeoh/soft-drain/compare/v0.2.0...v0.3.0) (2026-08-17)
 
 
